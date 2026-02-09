@@ -1,0 +1,1031 @@
+import Metal
+import CoreGraphics
+import Foundation
+import MetalPerformanceShaders
+
+/// Pyramid blending for high-quality focus stacking
+/// Uses multi-scale Laplacian pyramid to reduce halos and improve edge quality
+/// Renamed to PyBlend for consistency with project terminology
+public class PyBlend {
+    
+    private let context: MetalContext
+    private let levels: Int // Number of pyramid levels
+    
+    // Optimized for 10MP output (3840x2560)
+    // 4 levels: excellent quality for 10MP, ~6GB peak memory for 13 images
+    // Processing time: ~50-70s for 13 images
+    public init(context: MetalContext, levels: Int = 4) {
+        self.context = context
+        self.levels = levels
+    }
+    
+    /// Blend images using Laplacian pyramid method
+    /// - Parameters:
+    ///   - images: Input images (already aligned)
+    ///   - focusMaps: Focus quality maps for each image
+    /// - Returns: Blended output texture
+    public func blend(images: [MTLTexture], focusMaps: [MTLTexture]) throws -> MTLTexture {
+        guard images.count == focusMaps.count, !images.isEmpty else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid input"])
+        }
+        
+        let width = images[0].width
+        let _ = images[0].height // Suppress warning
+        
+        print("Pyramid blending: \(images.count) images, \(levels) levels")
+                // Step 0: Optimize focus maps significantly
+        // This is critical - Laplacian is often too noisy. 
+        // We will perform a heavy Gaussian blur on the focus maps to reduce noise
+        // and create more coherent focus regions.
+        print("  [0/4] Pre-processing focus maps...")
+        var processedFocusMaps: [MTLTexture] = []
+        for focusMap in focusMaps {
+            // Apply strong blur to connect disjointed focus pixels into regions
+            // Restored to 25.0 (original good value) as reducing it caused noise/loss of coherence
+            let blurred = try gaussianBlur(focusMap, radius: 25.0) 
+            processedFocusMaps.append(blurred)
+        }
+        
+        // Step 1: Normalize optimized focus maps
+        print("  [1/4] Normalizing... ")
+        var normalizedFocusMaps: [MTLTexture] = []
+        for processed in processedFocusMaps {
+            let normalized = try normalizeFocusMap(processed)
+            normalizedFocusMaps.append(normalized)
+        }
+                // Step 1: Build Gaussian pyramids for each image
+        print("  [1/4] Building Gaussian pyramids...")
+        var gaussianPyramids: [[MTLTexture]] = []
+        for (i, image) in images.enumerated() {
+            let pyramid = try buildGaussianPyramid(image)
+            gaussianPyramids.append(pyramid)
+            if i == 0 || i == images.count - 1 {
+                print("    Image \(i): pyramid levels = \(pyramid.count)")
+            }
+        }
+        
+        // Step 2: Build Laplacian pyramids from Gaussian pyramids
+        print("  [2/4] Building Laplacian pyramids...")
+        var laplacianPyramids: [[MTLTexture]] = []
+        for pyramid in gaussianPyramids {
+            let laplacian = try buildLaplacianPyramid(gaussianPyramid: pyramid)
+            laplacianPyramids.append(laplacian)
+        }
+        
+        // Step 3: Build weight pyramids from focus maps
+        print("  [3/4] Building weight pyramids...")
+        var weightPyramids: [[MTLTexture]] = []
+        for focusMap in normalizedFocusMaps {
+            let weights = try buildWeightPyramid(focusMap)
+            weightPyramids.append(weights)
+        }
+        
+        // Step 4: Blend Laplacian pyramids using weights
+        print("  [4/4] Blending pyramids...")
+        let blendedPyramid = try blendPyramids(
+            laplacianPyramids: laplacianPyramids,
+            weightPyramids: weightPyramids
+        )
+        
+        // Release intermediate pyramids to free memory
+        laplacianPyramids.removeAll()
+        weightPyramids.removeAll()
+        gaussianPyramids.removeAll()
+        normalizedFocusMaps.removeAll()
+        
+        // Step 5: Collapse pyramid to final image
+        print("  Collapsing pyramid to final image...")
+        let result = try collapsePyramid(blendedPyramid)
+        
+        // CRITICAL: Wait for ALL GPU operations to complete before returning
+        // Result texture must be fully rendered before save
+        if let commandBuffer = context.commandQueue.makeCommandBuffer() {
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+        }
+        
+        return result
+    }
+    
+    /// Build Gaussian pyramid (repeated downsampling)
+    private func buildGaussianPyramid(_ image: MTLTexture) throws -> [MTLTexture] {
+        var pyramid: [MTLTexture] = [image]
+        var currentImage = image
+        
+        for _ in 1..<levels {
+            let downsampledImage = try gaussianDownsample(currentImage)
+            pyramid.append(downsampledImage)
+            currentImage = downsampledImage
+        }
+        
+        return pyramid
+    }
+    
+    /// Build Laplacian pyramid (difference between levels)
+    private func buildLaplacianPyramid(gaussianPyramid: [MTLTexture]) throws -> [MTLTexture] {
+        var laplacianPyramid: [MTLTexture] = []
+        
+        for i in 0..<(gaussianPyramid.count - 1) {
+            let current = gaussianPyramid[i]
+            let next = gaussianPyramid[i + 1]
+            
+            // Upsample next level and subtract from current
+            let upsampled = try upsample(next, targetWidth: current.width, targetHeight: current.height)
+            let difference = try subtract(current, upsampled)
+            
+            laplacianPyramid.append(difference)
+        }
+        
+        // Add the smallest Gaussian level as the last Laplacian level
+        laplacianPyramid.append(gaussianPyramid.last!)
+        
+        return laplacianPyramid
+    }
+    
+    /// Build weight pyramid (Gaussian pyramid of focus map)
+    private func buildWeightPyramid(_ focusMap: MTLTexture) throws -> [MTLTexture] {
+        // Use simple averaging for weights to preserve sharpness.
+        // Gaussian blur was causing excessive blurriness in the final result.
+        var pyramid: [MTLTexture] = [focusMap]
+        var currentImage = focusMap
+        
+        for _ in 1..<levels {
+            // Use simpler 2x2 average downsample to preserve weight boundaries
+            let downsampledImage = try averageDownsample(currentImage)
+            pyramid.append(downsampledImage)
+            currentImage = downsampledImage
+        }
+        
+        return pyramid
+    }
+    
+    /// Downsample using Gaussian blur (standard pyramid reduction)
+
+
+    /// Removed old maxPoolDownsample in favor of gaussianDownsample
+    
+    /// Blend multiple Laplacian pyramids using weight pyramids
+    private func blendPyramids(laplacianPyramids: [[MTLTexture]], weightPyramids: [[MTLTexture]]) throws -> [MTLTexture] {
+        let numLevels = laplacianPyramids[0].count
+        var blendedPyramid: [MTLTexture] = []
+        
+        for level in 0..<numLevels {
+            // Collect all Laplacian levels and weights for this level
+            var laplacianLevels: [MTLTexture] = []
+            var weightLevels: [MTLTexture] = []
+            
+            for i in 0..<laplacianPyramids.count {
+                laplacianLevels.append(laplacianPyramids[i][level])
+                weightLevels.append(weightPyramids[i][level])
+            }
+            
+            // Blend this level
+            let blended = try blendLevel(laplacianLevels: laplacianLevels, weightLevels: weightLevels)
+            blendedPyramid.append(blended)
+        }
+        
+        return blendedPyramid
+    }
+    
+    /// Blend a single pyramid level using weighted accumulation on GPU
+    private func blendLevel(laplacianLevels: [MTLTexture], weightLevels: [MTLTexture]) throws -> MTLTexture {
+        let width = laplacianLevels[0].width
+        let height = laplacianLevels[0].height
+        
+        // 1. Create accumulation textures (High precision float for summation)
+        let mode = MTLPixelFormat.rgba32Float
+        let accDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: mode, width: width, height: height, mipmapped: false)
+        accDesc.usage = [.shaderRead, .shaderWrite]
+        
+        guard let accValueTexture = context.device.makeTexture(descriptor: accDesc),
+              let accWeightTexture = context.device.makeTexture(descriptor: accDesc) else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create accumulation textures"])
+        }
+        
+        // Initialize accumulators to 0
+        try clearTexture(accValueTexture)
+        try clearTexture(accWeightTexture) // Max weight tracker
+        
+        // 2. Setup GPU Pipeline for Accumulation
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        kernel void accumulate_level(
+            texture2d<float, access::read> laplacian [[texture(0)]],
+            texture2d<float, access::read> weight [[texture(1)]],
+            texture2d<float, access::read_write> accValue [[texture(2)]],
+            texture2d<float, access::read_write> accWeight [[texture(3)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= accValue.get_width() || gid.y >= accValue.get_height()) {
+                return;
+            }
+            
+            float4 lapVal = laplacian.read(gid);
+            float w = weight.read(gid).r; // Use R channel as weight
+            
+            // Validate weight
+            w = max(0.0, w);
+
+            // Max-Weight blending logic (Winner takes all)
+            // Reverting to this method as it produces the sharpest results.
+            // Tuning blur radius in pre-processing to handle halos instead of blending logic.
+
+            float currentMaxW = accWeight.read(gid).r; // We store max weight here
+            
+            if (w > currentMaxW) {
+                 // New winner found
+                 accValue.write(lapVal, gid);
+                 accWeight.write(float4(w, w, w, 1.0), gid);
+            }
+        }
+        
+        kernel void finalize_level(
+            texture2d<float, access::read> accValue [[texture(0)]],
+            texture2d<float, access::read> accWeight [[texture(1)]],
+            texture2d<float, access::write> output [[texture(2)]],
+            constant uint &count [[buffer(0)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
+                return;
+            }
+            
+            // Just read the winner value
+            float4 result = accValue.read(gid);
+            
+            // Force alpha to 1.0 for final display
+            result.a = 1.0;
+            
+            output.write(result, gid);
+        }
+        """
+        
+        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let accumulateFunction = library.makeFunction(name: "accumulate_level")!
+        let finalizeFunction = library.makeFunction(name: "finalize_level")!
+        
+        let accumulatePipeline = try context.device.makeComputePipelineState(function: accumulateFunction)
+        let finalizePipeline = try context.device.makeComputePipelineState(function: finalizeFunction)
+        
+        // 3. Accumulation Pass: Loop through all images
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer() else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
+        }
+        
+        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (width + 15) / 16,
+            height: (height + 15) / 16,
+            depth: 1
+        )
+        
+        // Batch accumulation commands
+        for i in 0..<laplacianLevels.count {
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else { continue }
+            encoder.setComputePipelineState(accumulatePipeline)
+            encoder.setTexture(laplacianLevels[i], index: 0)
+            encoder.setTexture(weightLevels[i], index: 1)
+            encoder.setTexture(accValueTexture, index: 2)
+            encoder.setTexture(accWeightTexture, index: 3)
+            encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+            encoder.endEncoding()
+        }
+        
+        // 4. Finalize Pass: Normalize by total weight
+        let outputDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+        outputDesc.usage = [.shaderRead, .shaderWrite]
+        guard let outputTexture = context.device.makeTexture(descriptor: outputDesc),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create output texture"])
+        }
+        
+        encoder.setComputePipelineState(finalizePipeline)
+        encoder.setTexture(accValueTexture, index: 0)
+        encoder.setTexture(accWeightTexture, index: 1)
+        encoder.setTexture(outputTexture, index: 2)
+        
+        // Optional debugging count buffer (not currently used by shader logic but good practice to pass info)
+        var count = UInt32(laplacianLevels.count)
+        encoder.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 0)
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        // No wait - let GPU work async
+        
+        return outputTexture
+    }
+    
+    /// Helper to clear a texture to zero
+    private func clearTexture(_ texture: MTLTexture) throws {
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void clear_tex(texture2d<float, access::write> out [[texture(0)]], uint2 gid [[thread_position_in_grid]]) {
+            if (gid.x < out.get_width() && gid.y < out.get_height()) out.write(float4(0), gid);
+        }
+        """
+        let lib = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let f = lib.makeFunction(name: "clear_tex")!
+        let pipeline = try context.device.makeComputePipelineState(function: f)
+        
+        guard let cmd = context.commandQueue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pipeline)
+        enc.setTexture(texture, index: 0)
+        let groups = MTLSize(width: (texture.width+15)/16, height: (texture.height+15)/16, depth: 1)
+        enc.dispatchThreadgroups(groups, threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+    }
+    
+    /// Normalize focus map to [0, 1] range
+    private func normalizeFocusMap(_ focusMap: MTLTexture) throws -> MTLTexture {
+        // Use Metal Performance Shaders for fast GPU statistics
+        // This avoids reading the entire 48MB texture back to CPU for every image
+        
+        let minMaxKernel = MPSImageStatisticsMinAndMax(device: context.device)
+        let meanKernel = MPSImageStatisticsMeanAndVariance(device: context.device)
+        
+        // Output textures for stats
+        // MinMax: 2x1 texture (Pixel 0 = Min, Pixel 1 = Max)
+        // Mean: 2x1 texture (Pixel 0 = Mean, Pixel 1 = Variance)
+        
+        let statsDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: focusMap.pixelFormat, // Use same format (e.g. .r32Float)
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        statsDescriptor.usage = [.shaderWrite, .shaderRead]
+        // Ensure shared storage mode so CPU can read it easily (or copy efficiently)
+        statsDescriptor.storageMode = .shared 
+        
+        guard let minMaxTexture = context.device.makeTexture(descriptor: statsDescriptor),
+              let meanTexture = context.device.makeTexture(descriptor: statsDescriptor),
+              let commandBuffer = context.commandQueue.makeCommandBuffer() else {
+             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create stats resources"])
+        }
+        
+        // Encode kernels
+        minMaxKernel.encode(commandBuffer: commandBuffer, sourceTexture: focusMap, destinationTexture: minMaxTexture)
+        meanKernel.encode(commandBuffer: commandBuffer, sourceTexture: focusMap, destinationTexture: meanTexture)
+        
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted() // Must wait to read stats
+        
+        // Read results from tiny textures (fast)
+        // 2 pixels * 4 components * 4 bytes = 32 bytes (if rgba)
+        // The focusMap is likely R32Float or RGBA32Float.
+        // MPS writes min/max to the channels of the pixel.
+        // If source is single channel (R), it writes to R.
+        
+        // Let's assume R32Float for simplicity of reading, but check focusMap format.
+        // Usually focusMap in this project is R32Float or RGBA32Float with value in R.
+        
+        // Helper to read float values
+        func readValues(from texture: MTLTexture) -> [Float] {
+            let count = texture.width * texture.height * 4 // Assuming potentially 4 channels per pixel if we read blindly
+            var output = [Float](repeating: 0, count: count)
+            texture.getBytes(&output, bytesPerRow: texture.width * 16, from: MTLRegionMake2D(0, 0, texture.width, 1), mipmapLevel: 0)
+            return output
+        }
+        
+        let minMaxData = readValues(from: minMaxTexture)
+        let meanData = readValues(from: meanTexture)
+        
+        // Pixel 0 is Min, Pixel 1 is Max
+        // If format is RGBA, we look at the relevant channel (R).
+        // MPS documentation says:
+        // "The global minimum value is stored in the first pixel... The global maximum used is stored in the second pixel..."
+        // If the source image has 1 channel, the statistics are in the first channel of the destination.
+        
+        let minVal = minMaxData[0] // Min is at (0,0) - Red component
+        let maxVal = minMaxData[4] // Max is at (1,0) - Red component (offset 4 floats)
+        
+        let avgVal = meanData[0]   // Mean is at (0,0) - Red component
+        
+        // Original logic:
+        var effectiveMax = maxVal
+        if maxVal > avgVal * 20.0 {
+            effectiveMax = avgVal * 20.0
+            print("  [Focus Normalization] Outlier detected. Max: \(maxVal), Avg: \(avgVal). Clamping to \(effectiveMax)")
+        }
+        
+        // Create normalized texture
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float,
+            width: focusMap.width,
+            height: focusMap.height,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+        
+        guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
+        }
+        
+        let range = effectiveMax - minVal
+        
+        // Define GPU Kernel for Normalization
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        kernel void normalize_focus(
+            texture2d<float, access::read> input [[texture(0)]],
+            texture2d<float, access::write> output [[texture(1)]],
+            constant float &minVal [[buffer(0)]],
+            constant float &range [[buffer(1)]],
+            constant float &effectiveMax [[buffer(2)]],
+            constant float &exponent [[buffer(3)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
+                return;
+            }
+            
+            // Handle uniform case or empty range
+            if (range < 0.0001) {
+                output.write(float4(1.0, 1.0, 1.0, 1.0), gid);
+                return;
+            }
+            
+            float val = input.read(gid).r;
+            float clamped = min(val, effectiveMax);
+            float normalized = (clamped - minVal) / range;
+            float sharpened = pow(normalized, exponent);
+            
+            output.write(float4(sharpened, sharpened, sharpened, 1.0), gid);
+        }
+        """
+        
+        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let function = library.makeFunction(name: "normalize_focus")!
+        let pipeline = try context.device.makeComputePipelineState(function: function)
+        
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(focusMap, index: 0)
+        encoder.setTexture(outputTexture, index: 1)
+        
+        var minValParam = minVal
+        var rangeParam = range
+        var maxParam = effectiveMax
+        var exponentParam: Float = 1.2
+        
+        encoder.setBytes(&minValParam, length: MemoryLayout<Float>.size, index: 0)
+        encoder.setBytes(&rangeParam, length: MemoryLayout<Float>.size, index: 1)
+        encoder.setBytes(&maxParam, length: MemoryLayout<Float>.size, index: 2)
+        encoder.setBytes(&exponentParam, length: MemoryLayout<Float>.size, index: 3)
+        
+        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (focusMap.width + 15) / 16,
+            height: (focusMap.height + 15) / 16,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        // Async GPU - no wait needed
+        
+        return outputTexture
+    }
+    
+    /// Collapse pyramid back to full-resolution image
+    private func collapsePyramid(_ pyramid: [MTLTexture]) throws -> MTLTexture {
+        // Start from the smallest level
+        var current = pyramid.last!
+        
+        // Upsample and add each level
+        for i in stride(from: pyramid.count - 2, through: 0, by: -1) {
+            let level = pyramid[i]
+            let upsampled = try upsample(current, targetWidth: level.width, targetHeight: level.height)
+            current = try add(upsampled, level)
+        }
+        
+        // Apply moderate unsharp mask to recover sharpness
+        // Restored to 1.5 (original good value) from 1.0
+        current = try unsharpMask(current, amount: 1.5, radius: 1.0)
+        
+        // Ensure alpha channel is 1.0
+        current = try setAlphaToOne(current)
+        
+        return current
+    }
+    
+    /// Set alpha channel to 1.0 for all pixels
+    private func setAlphaToOne(_ texture: MTLTexture) throws -> MTLTexture {
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        kernel void set_alpha(
+            texture2d<float, access::read> input [[texture(0)]],
+            texture2d<float, access::write> output [[texture(1)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
+                return;
+            }
+            
+            float4 color = input.read(gid);
+            color.a = 1.0;
+            output.write(color, gid);
+        }
+        """
+        
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float,
+            width: texture.width,
+            height: texture.height,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+        
+        guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
+        }
+        
+        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let function = library.makeFunction(name: "set_alpha")!
+        let pipeline = try context.device.makeComputePipelineState(function: function)
+        
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(texture, index: 0)
+        encoder.setTexture(outputTexture, index: 1)
+        
+        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (texture.width + 15) / 16,
+            height: (texture.height + 15) / 16,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        // Async GPU - no wait needed
+        
+        return outputTexture
+    }
+    
+    // MARK: - Texture Operations
+    
+    private func gaussianDownsample(_ texture: MTLTexture) throws -> MTLTexture {
+        let newWidth = max(1, texture.width / 2)
+        let newHeight = max(1, texture.height / 2)
+        
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float,
+            width: newWidth,
+            height: newHeight,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+        
+        guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
+        }
+        
+        // Use the existing Gaussian downsample kernel
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        
+        guard let pipeline = context.gaussianDownsamplePipeline else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Gaussian downsample pipeline not available"])
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(texture, index: 0)
+        encoder.setTexture(outputTexture, index: 1)
+        
+        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (newWidth + 15) / 16,
+            height: (newHeight + 15) / 16,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        // Async GPU - no wait needed
+        
+        return outputTexture
+    }
+    
+    /// Simple 2x2 average downsampling for weight pyramids
+    /// Preserves sharp boundaries better than Gaussian blur
+    private func averageDownsample(_ texture: MTLTexture) throws -> MTLTexture {
+        let newWidth = max(1, texture.width / 2)
+        let newHeight = max(1, texture.height / 2)
+        
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float,
+            width: newWidth,
+            height: newHeight,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+        
+        guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
+        }
+        
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        kernel void average_downsample(
+            texture2d<float, access::read> input [[texture(0)]],
+            texture2d<float, access::write> output [[texture(1)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
+                return;
+            }
+            
+            // Sample 2x2 block from input
+            int2 input_pos = int2(gid) * 2;
+            
+            float4 sum = float4(0.0);
+            for (int dy = 0; dy < 2; dy++) {
+                for (int dx = 0; dx < 2; dx++) {
+                    int2 sample_pos = clamp(input_pos + int2(dx, dy), 
+                                           int2(0), 
+                                           int2(input.get_width()-1, input.get_height()-1));
+                    sum += input.read(uint2(sample_pos));
+                }
+            }
+            
+            output.write(sum * 0.25, gid);
+        }
+        """
+        
+        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let function = library.makeFunction(name: "average_downsample")!
+        let pipeline = try context.device.makeComputePipelineState(function: function)
+        
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(texture, index: 0)
+        encoder.setTexture(outputTexture, index: 1)
+        
+        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (newWidth + 15) / 16,
+            height: (newHeight + 15) / 16,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        
+        return outputTexture
+    }
+    
+    private func upsample(_ texture: MTLTexture, targetWidth: Int, targetHeight: Int) throws -> MTLTexture {
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float,
+            width: targetWidth,
+            height: targetHeight,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+        
+        guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
+        }
+        
+        // Simple bilinear upsample using Metal sampler
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        kernel void upsample(
+            texture2d<float, access::sample> input [[texture(0)]],
+            texture2d<float, access::write> output [[texture(1)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
+                return;
+            }
+            
+            constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+            
+            float2 coord = float2(gid) / float2(output.get_width(), output.get_height());
+            float4 color = input.sample(s, coord);
+            
+            output.write(color, gid);
+        }
+        """
+        
+        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let function = library.makeFunction(name: "upsample")!
+        let pipeline = try context.device.makeComputePipelineState(function: function)
+        
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(texture, index: 0)
+        encoder.setTexture(outputTexture, index: 1)
+        
+        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (targetWidth + 15) / 16,
+            height: (targetHeight + 15) / 16,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        // Async GPU - no wait needed
+        
+        return outputTexture
+    }
+    
+    private func subtract(_ a: MTLTexture, _ b: MTLTexture) throws -> MTLTexture {
+        return try applyBinaryOp(a, b, operation: "a - b")
+    }
+    
+    private func add(_ a: MTLTexture, _ b: MTLTexture) throws -> MTLTexture {
+        return try applyBinaryOp(a, b, operation: "a + b")
+    }
+    
+    private func applyBinaryOp(_ a: MTLTexture, _ b: MTLTexture, operation: String) throws -> MTLTexture {
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float,
+            width: a.width,
+            height: a.height,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+        
+        guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
+        }
+        
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        kernel void binary_op(
+            texture2d<float, access::read> texA [[texture(0)]],
+            texture2d<float, access::read> texB [[texture(1)]],
+            texture2d<float, access::write> output [[texture(2)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
+                return;
+            }
+            
+            float4 a = texA.read(gid);
+            float4 b = texB.read(gid);
+            float4 result = \(operation);
+            
+            output.write(result, gid);
+        }
+        """
+        
+        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let function = library.makeFunction(name: "binary_op")!
+        let pipeline = try context.device.makeComputePipelineState(function: function)
+        
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(a, index: 0)
+        encoder.setTexture(b, index: 1)
+        encoder.setTexture(outputTexture, index: 2)
+        
+        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (a.width + 15) / 16,
+            height: (a.height + 15) / 16,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        // Async GPU - no wait needed
+        
+        return outputTexture
+    }
+    
+    /// Apply unsharp mask for edge enhancement
+    /// Formula: Output = Original + Amount * (Original - Blurred)
+    private func unsharpMask(_ texture: MTLTexture, amount: Float = 0.8, radius: Float = 1.5) throws -> MTLTexture {
+        // First, create a blurred version
+        let blurred = try gaussianBlur(texture, radius: radius)
+        
+        // Then apply unsharp mask formula
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        kernel void unsharp_mask(
+            texture2d<float, access::read> original [[texture(0)]],
+            texture2d<float, access::read> blurred [[texture(1)]],
+            texture2d<float, access::write> output [[texture(2)]],
+            constant float &amount [[buffer(0)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
+                return;
+            }
+            
+            float4 orig = original.read(gid);
+            float4 blur = blurred.read(gid);
+            
+            // Unsharp mask: Original + Amount * (Original - Blurred)
+            float4 result = orig + amount * (orig - blur);
+            
+            // Clamp to valid range [0, 1] to prevent overshooting
+            result = clamp(result, 0.0, 1.0);
+            result.a = 1.0;
+            
+            output.write(result, gid);
+        }
+        """
+        
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float,
+            width: texture.width,
+            height: texture.height,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+        
+        guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
+        }
+        
+        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let function = library.makeFunction(name: "unsharp_mask")!
+        let pipeline = try context.device.makeComputePipelineState(function: function)
+        
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(texture, index: 0)
+        encoder.setTexture(blurred, index: 1)
+        encoder.setTexture(outputTexture, index: 2)
+        
+        var amountParam = amount
+        encoder.setBytes(&amountParam, length: MemoryLayout<Float>.size, index: 0)
+        
+        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (texture.width + 15) / 16,
+            height: (texture.height + 15) / 16,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        
+        return outputTexture
+    }
+    
+    /// Gaussian blur with configurable radius
+    private func gaussianBlur(_ texture: MTLTexture, radius: Float = 1.5) throws -> MTLTexture {
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float,
+            width: texture.width,
+            height: texture.height,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+        
+        guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
+        }
+        
+        // Simple box blur approximation for Gaussian
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        kernel void gaussian_blur(
+            texture2d<float, access::read> input [[texture(0)]],
+            texture2d<float, access::write> output [[texture(1)]],
+            constant int &radius [[buffer(0)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
+                return;
+            }
+            
+            int2 center = int2(gid);
+            float4 sum = float4(0.0);
+            float count = 0.0;
+            
+            // Box blur in radius
+            for (int dy = -radius; dy <= radius; dy++) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    int2 sample_pos = clamp(center + int2(dx, dy),
+                                           int2(0),
+                                           int2(input.get_width()-1, input.get_height()-1));
+                    sum += input.read(uint2(sample_pos));
+                    count += 1.0;
+                }
+            }
+            
+            output.write(sum / count, gid);
+        }
+        """
+        
+        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let function = library.makeFunction(name: "gaussian_blur")!
+        let pipeline = try context.device.makeComputePipelineState(function: function)
+        
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(texture, index: 0)
+        encoder.setTexture(outputTexture, index: 1)
+        
+        var radiusParam = Int32(radius)
+        encoder.setBytes(&radiusParam, length: MemoryLayout<Int32>.size, index: 0)
+        
+        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (texture.width + 15) / 16,
+            height: (texture.height + 15) / 16,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        
+        commandBuffer.commit()
+        
+        return outputTexture
+    }
+    
+    private func readTexture(_ texture: MTLTexture) throws -> [Float] {
+        let width = texture.width
+        let height = texture.height
+        let bytesPerRow = width * 4 * MemoryLayout<Float>.size
+        var pixelData = [Float](repeating: 0, count: width * height * 4)
+        
+        let region = MTLRegion(
+            origin: MTLOrigin(x: 0, y: 0, z: 0),
+            size: MTLSize(width: width, height: height, depth: 1)
+        )
+        
+        pixelData.withUnsafeMutableBytes { ptr in
+            texture.getBytes(
+                ptr.baseAddress!,
+                bytesPerRow: bytesPerRow,
+                from: region,
+                mipmapLevel: 0
+            )
+        }
+        
+        return pixelData
+    }
+}

@@ -1,0 +1,45 @@
+# --- Core Image Processing (High Performance) ---
+# NumPy: Thư viện toán học cốt lõi, xử lý ma trận ảnh.
+numpy>=1.24.0
+
+# OpenCV (Headless): Phiên bản không chứa UI (Qt/X11) nhẹ hơn cho Server.
+# Dùng để căn chỉnh ảnh (Alignment) và biến đổi hình học.
+opencv-python-headless>=4.8.0
+
+# Scikit-image: Chứa các thuật toán xử lý ảnh khoa học (Filters, Morphology).
+# Dùng để tính toán độ sắc nét (Focus measure).
+scikit-image>=0.21.0
+
+# SciPy: Hỗ trợ các thuật toán tối ưu hóa phức tạp.
+scipy>=1.10.0
+
+# --- RAW Image Support (Crucial for Photography) ---
+# LibRaw wrapper: Đọc file RAW (CR3, NEF, ARW,...) cực nhanh và chuẩn màu.
+# OpenCV mặc định đọc RAW rất tệ, bắt buộc phải có cái này.
+rawpy>=0.18.0
+
+# ImageIO: Hỗ trợ đọc/ghi nhiều định dạng ảnh khoa học (TIFF 16-bit).
+imageio>=2.31.0
+
+# Pillow: Xử lý ảnh cơ bản, resize thumbnail cho Web UI.
+Pillow>=10.0.0
+
+# --- Web UI & System ---
+# Streamlit: Framework tạo giao diện web app.
+streamlit>=1.25.0
+
+# Watchdog: Theo dõi thay đổi file (nếu muốn làm tính năng Hot-folder sau này).
+watchdog>=3.0.0
+
+# --- Utilities ---
+# TQDM: Tạo thanh progress bar trên Terminal (để debug).
+tqdm>=4.65.0
+
+# Psutil: Theo dõi RAM/CPU của Mac để tránh crash khi full load.
+psutil>=5.9.0
+
+# --- Optional: Apple Silicon Hardware Acceleration ---
+# Nếu bạn muốn dùng GPU (Metal) để tính toán thay vì CPU sau này.
+# Bỏ comment dòng dưới nếu muốn cài PyTorch hỗ trợ MPS (Metal Performance Shaders).
+# torch
+# torchvision

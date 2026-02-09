@@ -1,0 +1,5 @@
+module CLibRaw {
+    header "libraw_wrapper.h"
+    link "raw"
+    export *
+}

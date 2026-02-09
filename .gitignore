@@ -1,0 +1,72 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Swift
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+!default.xcworkspace
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+
+# Temporary files
+*.tmp
+*.swp
+*~
+*.bak
+
+# HeyFoS specific - User uploads and processed data
+/users/
+/temp/
+/uploads/
+/output/
+/test_data/
+/tiff-samples/
+
+# Large image files
+*.tiff
+*.tif
+*.dng
+*.cr2
+*.cr3
+*.nef
+*.arw
+*.orf
+*.raw
+*.rw2
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test data
+test-*/
+test_*
