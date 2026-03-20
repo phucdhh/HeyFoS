@@ -137,10 +137,14 @@ func performProcessing(stackId: String, jobId: String, params: ProcessingParams,
     // Determine focus method
     let focusMethod: FocusMeasureProcessor.Method
     switch params.depthMapAlgorithm {
-    case "variance":
+    case "tenengrad":
         focusMethod = .tenengrad
+    case "ensemble":
+        focusMethod = .ensemble
+    case "variance":
+        focusMethod = .tenengrad  // legacy alias
     default:
-        focusMethod = .laplacian
+        focusMethod = .ensemble  // ensemble is the new default
     }
 
     HeyFoSServer.jobStatuses[jobId] = [
@@ -170,6 +174,8 @@ func performProcessing(stackId: String, jobId: String, params: ProcessingParams,
         method: focusMethod,
         useAlignment: false, // TODO: Add alignment option
         usePyramidBlending: params.blendingAlgorithm == "pyramid",
+        pyramidLevels: params.pyramidLevels,
+        blurRadius: params.blurRadius,
         verbose: false
     )
 

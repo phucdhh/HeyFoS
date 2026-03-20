@@ -10,6 +10,7 @@ public final class FocusMeasureProcessor {
     public enum Method {
         case laplacian
         case tenengrad
+        case ensemble  // Laplacian + Tenengrad + Local Variance with specular suppression
     }
     
     public init(metalContext: MetalContext) {
@@ -43,6 +44,8 @@ public final class FocusMeasureProcessor {
             pipeline = metalContext.laplacianPipeline
         case .tenengrad:
             pipeline = metalContext.tenengradPipeline
+        case .ensemble:
+            pipeline = metalContext.ensembleFocusPipeline
         }
         
         guard let pipeline = pipeline else {

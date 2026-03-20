@@ -9,12 +9,14 @@ import MetalPerformanceShaders
 public class PyBlend {
     
     private let context: MetalContext
-    private let levels: Int // Number of pyramid levels
+    private let levels: Int      // Number of pyramid levels
+    private let blurRadius: Double  // Gaussian blur radius for focus map pre-processing
     
-    // 6 levels: better multi-scale blending, captures both fine detail and large regions
-    public init(context: MetalContext, levels: Int = 6) {
+    // 5 levels: balanced multi-scale blending with reduced artifact accumulation
+    public init(context: MetalContext, levels: Int = 5, blurRadius: Double = 2.5) {
         self.context = context
         self.levels = levels
+        self.blurRadius = blurRadius
     }
     
     /// Blend images using Laplacian pyramid method
@@ -38,9 +40,9 @@ public class PyBlend {
         print("  [0/4] Pre-processing focus maps...")
         var processedFocusMaps: [MTLTexture] = []
         for focusMap in focusMaps {
-            // Mild blur to reduce noise while keeping focus boundaries tight.
-            // Large radius (e.g. 25) bleeds weights into wrong-source regions → halos.
-            let blurred = try gaussianBlur(focusMap, radius: 8.0)
+            // Blur radius from params: higher = smoother weight transitions, less ringing.
+            // Quick Win default: 2.5 (was 8.0 hardcoded) for tighter focus boundaries.
+            let blurred = try gaussianBlur(focusMap, radius: Float(blurRadius))
             processedFocusMaps.append(blurred)
         }
         

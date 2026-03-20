@@ -13,6 +13,7 @@ public final class MetalContext {
     // Compute pipelines
     public private(set) var laplacianPipeline: MTLComputePipelineState?
     public private(set) var tenengradPipeline: MTLComputePipelineState?
+    public private(set) var ensembleFocusPipeline: MTLComputePipelineState?
     public private(set) var gaussianDownsamplePipeline: MTLComputePipelineState?
     public private(set) var gaussianBlurPipeline: MTLComputePipelineState?
     public private(set) var rgbToGrayscalePipeline: MTLComputePipelineState?
@@ -67,6 +68,12 @@ public final class MetalContext {
         if let function = library.makeFunction(name: "tenengrad_focus_measure") {
             tenengradPipeline = try device.makeComputePipelineState(function: function)
             logger.debug("Tenengrad pipeline created")
+        }
+        
+        // Ensemble focus measure (Laplacian + Tenengrad + Local Variance with specular suppression)
+        if let function = library.makeFunction(name: "ensemble_focus_measure") {
+            ensembleFocusPipeline = try device.makeComputePipelineState(function: function)
+            logger.debug("Ensemble focus pipeline created")
         }
         
         // Gaussian downsample

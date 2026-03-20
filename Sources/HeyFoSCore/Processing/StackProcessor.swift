@@ -99,13 +99,15 @@ public final class StackProcessor {
         return focusMaps
     }
     
-    /// Full pipeline: load → compute focus → alignment check → blending → save
+    /// Full pipeline: load → compute focus → alignment check → color consistency → blending → save
     public func processStack(
         inputDirectory: URL,
         outputPath: String,
-        method: FocusMeasureProcessor.Method = .laplacian,
+        method: FocusMeasureProcessor.Method = .ensemble,
         useAlignment: Bool = true,
         usePyramidBlending: Bool = true,
+        pyramidLevels: Int = 5,
+        blurRadius: Double = 2.5,
         verbose: Bool = false
     ) throws {
         logger.info("=== Starting focus stacking pipeline ===")
@@ -114,6 +116,7 @@ public final class StackProcessor {
         logger.info("Method: \(method)")
         logger.info("Alignment check: \(useAlignment)")
         logger.info("Pyramid blending: \(usePyramidBlending)")
+        logger.info("Pyramid levels: \(pyramidLevels), blur radius: \(blurRadius)")
         
         // Step 1: Load images
         // Debug image source first
@@ -156,17 +159,24 @@ public final class StackProcessor {
             }
         }
         
+        // Step 3.5: Color consistency normalization
+        // Corrects per-frame exposure/luminance drift from focus breathing before blending.
+        logger.info("Normalizing color consistency across frames...")
+        let colorNormalizer = ColorConsistencyNormalizer(context: metalContext)
+        let normalizedImages = try colorNormalizer.normalize(images)
+        logger.info("✓ Color consistency normalization complete")
+        
         // Step 4: Perform blending
         let result: MTLTexture
         if usePyramidBlending {
             logger.info("Performing PyBlend (Pyramid Blending)...")
-            let blender = PyBlend(context: metalContext) // uses default levels (5)
-            result = try blender.blend(images: images, focusMaps: focusMaps)
+            let blender = PyBlend(context: metalContext, levels: pyramidLevels, blurRadius: blurRadius)
+            result = try blender.blend(images: normalizedImages, focusMaps: focusMaps)
             logger.info("✓ PyBlend complete")
         } else {
             logger.info("Performing DepthMap blending...")
             let blender = DepthMap(context: metalContext)
-            result = try blender.blend(images: images, focusMaps: focusMaps, verbose: verbose)
+            result = try blender.blend(images: normalizedImages, focusMaps: focusMaps, verbose: verbose)
             logger.info("✓ DepthMap blending complete")
         }
         

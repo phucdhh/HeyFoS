@@ -12,6 +12,16 @@ let metalShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
+// MARK: - Specular Suppression Helper
+// Reduces focus weight in specular (overexposed) regions that would otherwise
+// produce false high-frequency responses and halo artifacts.
+inline float computeSpecularWeight(float lum) {
+    // Soft transition from 1.0 (normal) down to 0.15 (peak specular)
+    // Threshold 0.86→0.92 targets the specular rim without clipping standard highlights.
+    float f = smoothstep(0.86, 0.92, lum);
+    return 1.0 - f * 0.85;
+}
+
 // MARK: - Focus Measure Kernels
 
 kernel void laplacian_focus_measure(
@@ -37,6 +47,9 @@ kernel void laplacian_focus_measure(
     
     // Amplify for better dynamic range (multiply by 1000)
     focus_score *= 1000.0;
+    
+    // Suppress specular highlights that generate false high focus scores
+    focus_score *= computeSpecularWeight(center);
     
     output.write(float4(focus_score, focus_score, focus_score, 1.0), gid);
 }
@@ -70,7 +83,68 @@ kernel void tenengrad_focus_measure(
     
     float gradient_mag = sqrt(gx * gx + gy * gy);
     
+    // Suppress specular highlights
+    float lum = input.read(gid).r;
+    gradient_mag *= computeSpecularWeight(lum);
+    
     output.write(float4(gradient_mag, gradient_mag, gradient_mag, 1.0), gid);
+}
+
+/// Ensemble focus measure: weighted combination of Laplacian, Tenengrad, and Local Variance
+/// with integrated specular suppression. More stable than any single metric alone.
+kernel void ensemble_focus_measure(
+    texture2d<float, access::read> input [[texture(0)]],
+    texture2d<float, access::write> output [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= input.get_width() || gid.y >= input.get_height()) {
+        return;
+    }
+    
+    int2 pos = int2(gid);
+    int2 sz  = int2(int(input.get_width()) - 1, int(input.get_height()) - 1);
+    float lum = input.read(uint2(pos)).r;
+    
+    // == Metric 1: Laplacian (3x3 cross) ==
+    float top    = input.read(uint2(clamp(pos + int2( 0,-1), int2(0), sz))).r;
+    float bottom = input.read(uint2(clamp(pos + int2( 0, 1), int2(0), sz))).r;
+    float lft    = input.read(uint2(clamp(pos + int2(-1, 0), int2(0), sz))).r;
+    float rgt    = input.read(uint2(clamp(pos + int2( 1, 0), int2(0), sz))).r;
+    float laplacian = abs(4.0 * lum - top - bottom - lft - rgt) * 1000.0;
+    
+    // == Metric 2: Tenengrad (Sobel gradient magnitude, scaled to match Laplacian range) ==
+    float gx = 0.0, gy = 0.0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int2 sp = clamp(pos + int2(dx, dy), int2(0), sz);
+            float p = input.read(uint2(sp)).r;
+            gx += p * float(dx) * (dy == 0 ? 2.0 : 1.0);
+            gy += p * float(dy) * (dx == 0 ? 2.0 : 1.0);
+        }
+    }
+    float tenengrad = sqrt(gx * gx + gy * gy) * 300.0;
+    
+    // == Metric 3: Local standard deviation (5x5) — captures texture richness ==
+    float vsum = 0.0, vsum2 = 0.0;
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            int2 sp = clamp(pos + int2(dx, dy), int2(0), sz);
+            float p = input.read(uint2(sp)).r;
+            vsum  += p;
+            vsum2 += p * p;
+        }
+    }
+    float mean5    = vsum / 25.0;
+    float variance = max(0.0, vsum2 / 25.0 - mean5 * mean5);
+    float local_std = sqrt(variance) * 2000.0;
+    
+    // == Weighted ensemble ==
+    float ensemble = 0.45 * laplacian + 0.35 * tenengrad + 0.20 * local_std;
+    
+    // == Specular suppression ==
+    ensemble *= computeSpecularWeight(lum);
+    
+    output.write(float4(ensemble, ensemble, ensemble, 1.0), gid);
 }
 
 kernel void gaussian_downsample(
