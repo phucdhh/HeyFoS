@@ -248,7 +248,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Contact
 
-- **Author**: Phuc Dinh
+- **Author**: Phuc Nguyen-Dang
 - **GitHub**: [@phucdhh](https://github.com/phucdhh)
 - **Project Link**: [https://github.com/phucdhh/HeyFoS](https://github.com/phucdhh/HeyFoS)
 

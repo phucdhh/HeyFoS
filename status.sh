@@ -7,9 +7,29 @@ BACKEND_PORT=7070
 FRONTEND_PORT=7071
 BACKEND_LOG="/tmp/heyfos-backend.log"
 FRONTEND_LOG="/tmp/heyfos-frontend.log"
+TUNNEL_LOG="/tmp/heyfos-tunnel.log"
+TUNNEL_CONFIG="/Users/mac/.cloudflared/config-heyfos.yml"
 
 echo "📊 HeyFoS Status"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Tunnel status
+echo "🌐 Cloudflare Tunnel (heyfos):"
+if TUNNEL_PID=$(pgrep -f "config-heyfos.yml" 2>/dev/null | head -1); then
+    echo "   Status: ✅ RUNNING"
+    echo "   PID: $TUNNEL_PID"
+    if [ -f "$TUNNEL_LOG" ]; then
+        CONN_COUNT=$(grep -c "Registered tunnel connection" "$TUNNEL_LOG" 2>/dev/null || echo 0)
+        echo "   Connections: $CONN_COUNT registered"
+        echo "   Last log entry:"
+        tail -1 "$TUNNEL_LOG" | sed 's/^/      /'
+    fi
+else
+    echo "   Status: ❌ NOT RUNNING"
+    echo "   Start with: nohup cloudflared tunnel --config $TUNNEL_CONFIG run > $TUNNEL_LOG 2>&1 &"
+fi
+
+echo ""
 
 # Backend status
 echo "🔧 Backend Server (port $BACKEND_PORT):"

@@ -45,6 +45,16 @@ else
     echo "⚠️  Frontend not running"
 fi
 
+# Stop Cloudflare tunnel
+if pgrep -f "config-heyfos.yml" >/dev/null 2>&1; then
+    echo "🌐 Stopping Cloudflare tunnel (heyfos)..."
+    pkill -f "config-heyfos.yml" 2>/dev/null || true
+    sleep 1
+    echo "   Tunnel stopped ✅"
+else
+    echo "⚠️  Tunnel not running"
+fi
+
 # Clean up any remaining node/npm processes related to heyfos
 pkill -f "heyfos-server" 2>/dev/null || true
 pkill -f "frontend.*npm start" 2>/dev/null || true

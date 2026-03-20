@@ -11,10 +11,8 @@ public class PyBlend {
     private let context: MetalContext
     private let levels: Int // Number of pyramid levels
     
-    // Optimized for 10MP output (3840x2560)
-    // 4 levels: excellent quality for 10MP, ~6GB peak memory for 13 images
-    // Processing time: ~50-70s for 13 images
-    public init(context: MetalContext, levels: Int = 4) {
+    // 6 levels: better multi-scale blending, captures both fine detail and large regions
+    public init(context: MetalContext, levels: Int = 6) {
         self.context = context
         self.levels = levels
     }
@@ -40,9 +38,9 @@ public class PyBlend {
         print("  [0/4] Pre-processing focus maps...")
         var processedFocusMaps: [MTLTexture] = []
         for focusMap in focusMaps {
-            // Apply strong blur to connect disjointed focus pixels into regions
-            // Restored to 25.0 (original good value) as reducing it caused noise/loss of coherence
-            let blurred = try gaussianBlur(focusMap, radius: 25.0) 
+            // Mild blur to reduce noise while keeping focus boundaries tight.
+            // Large radius (e.g. 25) bleeds weights into wrong-source regions → halos.
+            let blurred = try gaussianBlur(focusMap, radius: 8.0)
             processedFocusMaps.append(blurred)
         }
         
@@ -53,6 +51,12 @@ public class PyBlend {
             let normalized = try normalizeFocusMap(processed)
             normalizedFocusMaps.append(normalized)
         }
+
+        // Step 1.5: Cross-normalize so weights sum to exactly 1 at every pixel.
+        // CRITICAL for halo removal: without this, at background/edge pixels where all
+        // focus scores are near 0, finalize_level divides ~0 by ~0 → amplified noise → bright halos.
+        print("  [1.5/4] Cross-normalizing weights across images...")
+        normalizedFocusMaps = try crossNormalizeWeights(normalizedFocusMaps)
                 // Step 1: Build Gaussian pyramids for each image
         print("  [1/4] Building Gaussian pyramids...")
         var gaussianPyramids: [[MTLTexture]] = []
@@ -144,14 +148,13 @@ public class PyBlend {
     
     /// Build weight pyramid (Gaussian pyramid of focus map)
     private func buildWeightPyramid(_ focusMap: MTLTexture) throws -> [MTLTexture] {
-        // Use simple averaging for weights to preserve sharpness.
-        // Gaussian blur was causing excessive blurriness in the final result.
+        // MUST use Gaussian downsampling (same kernel as image pyramid) per Burt & Adelson 1983.
+        // Box/average downsampling creates aliased weight edges at each level → halos at all scales.
         var pyramid: [MTLTexture] = [focusMap]
         var currentImage = focusMap
         
         for _ in 1..<levels {
-            // Use simpler 2x2 average downsample to preserve weight boundaries
-            let downsampledImage = try averageDownsample(currentImage)
+            let downsampledImage = try gaussianDownsample(currentImage)
             pyramid.append(downsampledImage)
             currentImage = downsampledImage
         }
@@ -223,22 +226,15 @@ public class PyBlend {
             }
             
             float4 lapVal = laplacian.read(gid);
-            float w = weight.read(gid).r; // Use R channel as weight
-            
-            // Validate weight
-            w = max(0.0, w);
+            float w = max(0.0f, weight.read(gid).r);
+            // w is already raised to exponent 2.5 in normalizeFocusMap.
+            // Do NOT square again here — effective exponent would be ~5 → hard cutoffs → halos.
 
-            // Max-Weight blending logic (Winner takes all)
-            // Reverting to this method as it produces the sharpest results.
-            // Tuning blur radius in pre-processing to handle halos instead of blending logic.
-
-            float currentMaxW = accWeight.read(gid).r; // We store max weight here
-            
-            if (w > currentMaxW) {
-                 // New winner found
-                 accValue.write(lapVal, gid);
-                 accWeight.write(float4(w, w, w, 1.0), gid);
-            }
+            // Weighted-sum accumulation (true multi-resolution blending)
+            float4 curVal  = accValue.read(gid);
+            float  curW    = accWeight.read(gid).r;
+            accValue.write(curVal + lapVal * w, gid);
+            accWeight.write(float4(curW + w, 0.0, 0.0, 1.0), gid);
         }
         
         kernel void finalize_level(
@@ -252,12 +248,11 @@ public class PyBlend {
                 return;
             }
             
-            // Just read the winner value
-            float4 result = accValue.read(gid);
-            
-            // Force alpha to 1.0 for final display
+            float4 val = accValue.read(gid);
+            float  w   = accWeight.read(gid).r;
+            // Normalize: divide by total weight (avoid artifacts from uncovered pixels)
+            float4 result = (w > 1e-7f) ? (val / w) : val;
             result.a = 1.0;
-            
             output.write(result, gid);
         }
         """
@@ -341,10 +336,104 @@ public class PyBlend {
         cmd.commit()
     }
     
+    /// Cross-normalize weight maps so they sum to 1 at every pixel.
+    /// This is the fundamental requirement for halo-free multi-image Laplacian blending.
+    private func crossNormalizeWeights(_ weights: [MTLTexture]) throws -> [MTLTexture] {
+        guard weights.count > 1 else { return weights }
+        let width = weights[0].width
+        let height = weights[0].height
+
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        // Accumulate R channel of each weight map into a running sum
+        kernel void accum_sum(
+            texture2d<float, access::read>       weight [[texture(0)]],
+            texture2d<float, access::read_write> sum    [[texture(1)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= sum.get_width() || gid.y >= sum.get_height()) return;
+            float w = max(0.0f, weight.read(gid).r);
+            float s = sum.read(gid).r;
+            sum.write(float4(s + w, 0, 0, 1), gid);
+        }
+
+        // Divide each weight by its pixel’s total sum; output all channels equal
+        kernel void div_by_sum(
+            texture2d<float, access::read>  weight [[texture(0)]],
+            texture2d<float, access::read>  sum    [[texture(1)]],
+            texture2d<float, access::write> output [[texture(2)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+            float w = max(0.0f, weight.read(gid).r);
+            float s = sum.read(gid).r;
+            // epsilon prevents division-by-zero at background pixels; there all weights
+            // will be equal (1/N) so the blend is stable and evaluates to the mean color (black).
+            float norm = w / (s + 1e-7f);
+            output.write(float4(norm, norm, norm, 1.0f), gid);
+        }
+        """
+
+        let lib = try context.device.makeLibrary(source: shaderSource, options: nil)
+        let accumPipeline = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "accum_sum")!)
+        let divPipeline   = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "div_by_sum")!)
+
+        let tg      = MTLSize(width: 16, height: 16, depth: 1)
+        let tgCount = MTLSize(width: (width+15)/16, height: (height+15)/16, depth: 1)
+
+        // Create accumulator
+        let sumDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+        sumDesc.usage = [.shaderRead, .shaderWrite]
+        guard let sumTexture = context.device.makeTexture(descriptor: sumDesc) else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create sum texture"])
+        }
+        try clearTexture(sumTexture)
+
+        // Pass 1: accumulate
+        guard let cmd1 = context.commandQueue.makeCommandBuffer() else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
+        }
+        for weight in weights {
+            guard let enc = cmd1.makeComputeCommandEncoder() else { continue }
+            enc.setComputePipelineState(accumPipeline)
+            enc.setTexture(weight, index: 0)
+            enc.setTexture(sumTexture, index: 1)
+            enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tg)
+            enc.endEncoding()
+        }
+        cmd1.commit()
+        cmd1.waitUntilCompleted()
+
+        // Pass 2: divide
+        var result: [MTLTexture] = []
+        guard let cmd2 = context.commandQueue.makeCommandBuffer() else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
+        }
+        for weight in weights {
+            let outDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+            outDesc.usage = [.shaderRead, .shaderWrite]
+            guard let outTex = context.device.makeTexture(descriptor: outDesc) else {
+                throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create output texture"])
+            }
+            guard let enc = cmd2.makeComputeCommandEncoder() else { continue }
+            enc.setComputePipelineState(divPipeline)
+            enc.setTexture(weight, index: 0)
+            enc.setTexture(sumTexture, index: 1)
+            enc.setTexture(outTex, index: 2)
+            enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tg)
+            enc.endEncoding()
+            result.append(outTex)
+        }
+        cmd2.commit()
+        cmd2.waitUntilCompleted()
+
+        return result
+    }
+
     /// Normalize focus map to [0, 1] range
     private func normalizeFocusMap(_ focusMap: MTLTexture) throws -> MTLTexture {
-        // Use Metal Performance Shaders for fast GPU statistics
-        // This avoids reading the entire 48MB texture back to CPU for every image
         
         let minMaxKernel = MPSImageStatisticsMinAndMax(device: context.device)
         let meanKernel = MPSImageStatisticsMeanAndVariance(device: context.device)
@@ -478,7 +567,8 @@ public class PyBlend {
         var minValParam = minVal
         var rangeParam = range
         var maxParam = effectiveMax
-        var exponentParam: Float = 1.2
+        // Higher exponent = sharper focus selection; out-of-focus areas contribute much less
+        var exponentParam: Float = 2.5
         
         encoder.setBytes(&minValParam, length: MemoryLayout<Float>.size, index: 0)
         encoder.setBytes(&rangeParam, length: MemoryLayout<Float>.size, index: 1)
@@ -513,9 +603,8 @@ public class PyBlend {
             current = try add(upsampled, level)
         }
         
-        // Apply moderate unsharp mask to recover sharpness
-        // Restored to 1.5 (original good value) from 1.0
-        current = try unsharpMask(current, amount: 1.5, radius: 1.0)
+        // Subtle sharpening only. High amounts amplify any residual halos.
+        current = try unsharpMask(current, amount: 0.3, radius: 1.0)
         
         // Ensure alpha channel is 1.0
         current = try setAlphaToOne(current)
@@ -726,22 +815,36 @@ public class PyBlend {
         let shaderSource = """
         #include <metal_stdlib>
         using namespace metal;
-        
+
         kernel void upsample(
-            texture2d<float, access::sample> input [[texture(0)]],
+            texture2d<float, access::read>  input  [[texture(0)]],
             texture2d<float, access::write> output [[texture(1)]],
             uint2 gid [[thread_position_in_grid]])
         {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
-                return;
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+
+            // Map output pixel to fractional input coordinate
+            float in_x = (float(gid.x) + 0.5f) * float(input.get_width())  / float(output.get_width())  - 0.5f;
+            float in_y = (float(gid.y) + 0.5f) * float(input.get_height()) / float(output.get_height()) - 0.5f;
+            int cx = int(round(in_x));
+            int cy = int(round(in_y));
+
+            // Burt-Adelson 5-tap Gaussian kernel — matches the downsample kernel used to build
+            // the pyramid, so the expand/collapse pair is energy-conserving and halo-free.
+            float k[5] = {1.0f/16.0f, 4.0f/16.0f, 6.0f/16.0f, 4.0f/16.0f, 1.0f/16.0f};
+
+            float4 sum    = float4(0.0f);
+            float  totalW = 0.0f;
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dx = -2; dx <= 2; dx++) {
+                    int2 sp = clamp(int2(cx + dx, cy + dy),
+                                   int2(0), int2(int(input.get_width())-1, int(input.get_height())-1));
+                    float w = k[dx+2] * k[dy+2];
+                    sum    += input.read(uint2(sp)) * w;
+                    totalW += w;
+                }
             }
-            
-            constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
-            
-            float2 coord = float2(gid) / float2(output.get_width(), output.get_height());
-            float4 color = input.sample(s, coord);
-            
-            output.write(color, gid);
+            output.write(sum / totalW, gid);
         }
         """
         
@@ -928,7 +1031,14 @@ public class PyBlend {
     }
     
     /// Gaussian blur with configurable radius
+    /// Gaussian blur using MPS (true Gaussian, not box approximation)
     private func gaussianBlur(_ texture: MTLTexture, radius: Float = 1.5) throws -> MTLTexture {
+        // Map radius to sigma: for a Gaussian, 3σ ≈ radius, so σ = radius/3.
+        // Clamp to minimum 0.5 to avoid degenerate kernel.
+        let sigma = max(radius / 3.0, 0.5)
+        let blur = MPSImageGaussianBlur(device: context.device, sigma: sigma)
+        blur.edgeMode = .clamp
+
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba32Float,
             width: texture.width,
@@ -936,73 +1046,18 @@ public class PyBlend {
             mipmapped: false
         )
         textureDescriptor.usage = [.shaderRead, .shaderWrite]
-        
+
         guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
         }
-        
-        // Simple box blur approximation for Gaussian
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-        
-        kernel void gaussian_blur(
-            texture2d<float, access::read> input [[texture(0)]],
-            texture2d<float, access::write> output [[texture(1)]],
-            constant int &radius [[buffer(0)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
-                return;
-            }
-            
-            int2 center = int2(gid);
-            float4 sum = float4(0.0);
-            float count = 0.0;
-            
-            // Box blur in radius
-            for (int dy = -radius; dy <= radius; dy++) {
-                for (int dx = -radius; dx <= radius; dx++) {
-                    int2 sample_pos = clamp(center + int2(dx, dy),
-                                           int2(0),
-                                           int2(input.get_width()-1, input.get_height()-1));
-                    sum += input.read(uint2(sample_pos));
-                    count += 1.0;
-                }
-            }
-            
-            output.write(sum / count, gid);
-        }
-        """
-        
-        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let function = library.makeFunction(name: "gaussian_blur")!
-        let pipeline = try context.device.makeComputePipelineState(function: function)
-        
-        guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+
+        guard let commandBuffer = context.commandQueue.makeCommandBuffer() else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
         }
-        
-        encoder.setComputePipelineState(pipeline)
-        encoder.setTexture(texture, index: 0)
-        encoder.setTexture(outputTexture, index: 1)
-        
-        var radiusParam = Int32(radius)
-        encoder.setBytes(&radiusParam, length: MemoryLayout<Int32>.size, index: 0)
-        
-        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
-        let threadGroups = MTLSize(
-            width: (texture.width + 15) / 16,
-            height: (texture.height + 15) / 16,
-            depth: 1
-        )
-        
-        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
-        encoder.endEncoding()
-        
+
+        blur.encode(commandBuffer: commandBuffer, sourceTexture: texture, destinationTexture: outputTexture)
         commandBuffer.commit()
-        
+
         return outputTexture
     }
     

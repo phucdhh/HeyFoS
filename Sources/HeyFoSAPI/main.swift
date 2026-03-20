@@ -73,6 +73,8 @@ func routes(_ app: Application) throws {
     let api = app.grouped("api")
 
     // Stack management
+    api.post("stacks", "init", use: initStack)
+    api.post("stacks", ":stackId", "upload-file", use: uploadFile)
     api.post("stacks", "create", use: createStack)
     api.post("stacks", ":stackId", "process", use: processStack)
 
@@ -185,6 +187,49 @@ func performProcessing(stackId: String, jobId: String, params: ProcessingParams,
         "message": "Processing completed successfully",
         "resultPath": outputPath
     ]
+}
+
+func initStack(req: Request) async throws -> InitStackResponse {
+    let stackId = UUID().uuidString
+    let userId = req.headers.first(name: "X-User-ID") ?? "anonymous"
+    let sessionId = req.headers.first(name: "X-Session-ID") ?? UUID().uuidString
+
+    req.logger.info("📦 Init stack: \(stackId) for user: \(userId)")
+
+    let baseDir = URL(fileURLWithPath: "users")
+    let uploadDir = baseDir
+        .appendingPathComponent(userId)
+        .appendingPathComponent(sessionId)
+        .appendingPathComponent("upload")
+
+    try FileManager.default.createDirectory(at: uploadDir, withIntermediateDirectories: true)
+
+    HeyFoSServer.stackMetadata[stackId] = [
+        "userId": userId,
+        "sessionId": sessionId,
+        "uploadPath": uploadDir.path
+    ]
+
+    return InitStackResponse(stackId: stackId, message: "Stack initialized")
+}
+
+func uploadFile(req: Request) async throws -> UploadFileResponse {
+    guard let stackId = req.parameters.get("stackId") else {
+        throw Abort(.badRequest, reason: "Stack ID required")
+    }
+    guard let metadata = HeyFoSServer.stackMetadata[stackId],
+          let uploadPath = metadata["uploadPath"] else {
+        throw Abort(.notFound, reason: "Stack not found")
+    }
+
+    struct SingleFile: Content { var file: File }
+    let uploaded = try req.content.decode(SingleFile.self)
+    let fileURL = URL(fileURLWithPath: uploadPath).appendingPathComponent(uploaded.file.filename)
+    let data = Data(buffer: uploaded.file.data)
+    try data.write(to: fileURL)
+
+    req.logger.info("💾 Saved \(uploaded.file.filename) (\(data.count / 1024)KB) to stack \(stackId)")
+    return UploadFileResponse(filename: uploaded.file.filename, message: "File uploaded")
 }
 
 func createStack(req: Request) async throws -> CreateStackResponse {
@@ -441,6 +486,16 @@ struct ProcessingParams: Content {
     let blendingAlgorithm: String // "pyramid" or "linear"
     let pyramidLevels: Int
     let blurRadius: Double
+}
+
+struct InitStackResponse: Content {
+    let stackId: String
+    let message: String
+}
+
+struct UploadFileResponse: Content {
+    let filename: String
+    let message: String
 }
 
 struct CreateStackResponse: Content {
