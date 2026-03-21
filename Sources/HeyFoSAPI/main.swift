@@ -69,6 +69,32 @@ func routes(_ app: Application) throws {
         ]
     }
 
+    // ── Release download page ──────────────────────────────────────────────
+    // Serves release/index.html and release/*.zip at /release and /release/
+    let releaseDir = DirectoryConfiguration.detect().workingDirectory
+        .appending("release/")
+
+    app.get("release") { req -> Response in
+        return req.redirect(to: "/release/")
+    }
+    app.get("release", "") { req async throws -> Response in
+        let path = releaseDir + "index.html"
+        var res = req.fileio.streamFile(at: path)
+        res.headers.replaceOrAdd(name: .cacheControl, value: "no-store, no-cache, must-revalidate")
+        return res
+    }
+    app.get("release", ":filename") { req async throws -> Response in
+        let filename = try req.parameters.require("filename")
+        guard !filename.contains("/"), !filename.contains(".."),
+              !filename.hasPrefix(".") else {
+            throw Abort(.badRequest)
+        }
+        let path = releaseDir + filename
+        var res = req.fileio.streamFile(at: path)
+        res.headers.replaceOrAdd(name: .cacheControl, value: "no-store, no-cache, must-revalidate")
+        return res
+    }
+
     // API routes
     let api = app.grouped("api")
 

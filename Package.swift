@@ -21,6 +21,11 @@ let package = Package(
         .executable(
             name: "heyfos-server",
             targets: ["HeyFoSAPI"]
+        ),
+        // Native Desktop app
+        .executable(
+            name: "HeyFoS",
+            targets: ["HeyFoSApp"]
         )
     ],
     dependencies: [
@@ -52,9 +57,9 @@ let package = Package(
                 "CLibRaw",
                 .product(name: "Logging", package: "swift-log")
             ],
-            resources: [
-                .process("Resources")
-            ]
+            // Shaders.metal is embedded as a string in MetalShaderSource.swift for SPM
+            // compatibility (SPM does not compile .metal files into a Metal library).
+            exclude: ["Metal/Shaders.metal"]
         ),
         
         // CLI tool
@@ -75,6 +80,14 @@ let package = Package(
             ]
         ),
         
+        // Desktop app (SwiftUI, macOS 14+)
+        .executableTarget(
+            name: "HeyFoSApp",
+            dependencies: [
+                "HeyFoSCore",
+            ]
+        ),
+
         // Tests
         .testTarget(
             name: "HeyFoSCoreTests",

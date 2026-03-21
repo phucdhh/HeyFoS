@@ -36,39 +36,52 @@ public final class StackProcessor {
         return imageURLs
     }
     
-    /// Load all images from directory with optional downscaling
-    /// Default 3840 provides 10MP output - optimal for most users
+    /// Load all images from directory with optional downscaling.
+    /// Images are decoded in parallel (one thread per logical CPU / 2, capped at 4)
+    /// to exploit the M-series efficiency cores for I/O-bound work.
+    /// Default 3840 provides 10MP output — optimal for most users.
     public func loadImagesFromDirectory(_ url: URL, maxDimension: Int = 3840) throws -> [MTLTexture] {
         let imageURLs = try getAllImageURLs(url)
-        
-        guard !imageURLs.isEmpty else {
-            throw StackProcessingError.noImagesFound
-        }
-        
+        guard !imageURLs.isEmpty else { throw StackProcessingError.noImagesFound }
         logger.info("Found \(imageURLs.count) images in directory")
-        
-        var textures: [MTLTexture] = []
-        
-        for (index, imageURL) in imageURLs.enumerated() {
-            logger.info("[\(index + 1)/\(imageURLs.count)] Loading: \(imageURL.lastPathComponent)")
-            var texture = try imageLoader.loadImage(from: imageURL)
-            
-            // Downscale if image is too large to save memory
-            let maxSide = max(texture.width, texture.height)
-            if maxSide > maxDimension {
-                let scale = Float(maxDimension) / Float(maxSide)
-                let newWidth = Int(Float(texture.width) * scale)
-                let newHeight = Int(Float(texture.height) * scale)
-                
-                logger.info("  Downscaling from \(texture.width)x\(texture.height) to \(newWidth)x\(newHeight) to save memory")
-                texture = try downscaleTexture(texture, width: newWidth, height: newHeight)
+
+        // Pre-allocate result slots so index ordering is preserved
+        var textures   = [MTLTexture?](repeating: nil, count: imageURLs.count)
+        var firstError: Error?
+        let lock       = NSLock()
+
+        // Each ImageLoader uses its own LibRaw processor handle (thread-safe)
+        // and MTLDevice.makeTexture is documented thread-safe on Apple Silicon.
+        let parallelism = max(1, min(4, ProcessInfo.processInfo.processorCount / 2))
+
+        DispatchQueue.concurrentPerform(iterations: imageURLs.count) { index in
+            let url = imageURLs[index]
+            do {
+                let loader  = ImageLoader(metalContext: self.metalContext)   // fresh per thread
+                var texture = try loader.loadImage(from: url)
+
+                let maxSide = max(texture.width, texture.height)
+                if maxSide > maxDimension {
+                    let scale    = Float(maxDimension) / Float(maxSide)
+                    let newWidth = Int(Float(texture.width)  * scale)
+                    let newHeight = Int(Float(texture.height) * scale)
+                    texture = try self.downscaleTexture(texture, width: newWidth, height: newHeight)
+                }
+                lock.lock()
+                textures[index] = texture
+                lock.unlock()
+            } catch {
+                lock.lock()
+                if firstError == nil { firstError = error }
+                lock.unlock()
             }
-            
-            textures.append(texture)
         }
-        
-        logger.info("✓ Loaded \(textures.count) images successfully")
-        return textures
+
+        if let err = firstError { throw err }
+
+        let result = textures.compactMap { $0 }
+        logger.info("✓ Loaded \(result.count) images (parallelism: \(parallelism))")
+        return result
     }
     
     /// Compute focus measures for all images in stack
@@ -108,7 +121,8 @@ public final class StackProcessor {
         usePyramidBlending: Bool = true,
         pyramidLevels: Int = 5,
         blurRadius: Double = 2.5,
-        verbose: Bool = false
+        verbose: Bool = false,
+        progressHandler: ((Double, String) -> Void)? = nil
     ) throws {
         logger.info("=== Starting focus stacking pipeline ===")
         logger.info("Input: \(inputDirectory.path)")
@@ -124,6 +138,7 @@ public final class StackProcessor {
              ImageLoaderDebug.inspectImageSource(url: try self.getAllImageURLs(inputDirectory)[0])
         }
         
+        progressHandler?(0.05, "Loading images…")
         let images = try loadImagesFromDirectory(inputDirectory)
         
         // Debug first image loaded texture
@@ -133,26 +148,28 @@ public final class StackProcessor {
         }
         
         // Step 2: Compute focus measures
+        progressHandler?(0.20, "Computing focus measures…")
         let focusMaps = try computeFocusMeasures(for: images, method: method)
         
-        // Step 3: Check alignment if requested
+        // Step 3: Alignment check + correction
+        var alignedImages = images
         if useAlignment {
+            progressHandler?(0.40, "Checking alignment…")
             logger.info("Checking image alignment...")
-            let alignmentChecker = AlignmentChecker(context: metalContext)
-            let alignmentResults = try alignmentChecker.analyzeAlignment(images: images)
-            
-            // Check if alignment correction is needed
-            let maxShift = alignmentResults.map { sqrt($0.shiftX * $0.shiftX + $0.shiftY * $0.shiftY) }.max() ?? 0
-            if maxShift > 2.0 {
-                logger.warning("⚠️  Detected misalignment up to \(String(format: "%.1f", maxShift)) pixels")
-                logger.warning("   Alignment correction not yet implemented - results may have artifacts")
+            let aligner = AlignmentChecker(context: metalContext)
+            let alignmentResults = try aligner.analyzeAlignment(images: images)
+
+            let maxShift = alignmentResults.map { sqrtf($0.shiftX * $0.shiftX + $0.shiftY * $0.shiftY) }.max() ?? 0
+            if maxShift > 0.5 {
+                logger.info("⚠️  Detected misalignment up to \(String(format: "%.1f", maxShift)) px — correcting...")
+                alignedImages = try aligner.correctAlignment(images: images, threshold: 0.5)
+                logger.info("✓ Alignment correction applied")
             } else {
-                logger.info("✓ Images appear well-aligned (max shift: \(String(format: "%.2f", maxShift)) px)")
+                logger.info("✓ Images well-aligned (max shift: \(String(format: "%.2f", maxShift)) px)")
             }
-            
-            // Save difference map for first vs second image
+
             if images.count >= 2 && verbose {
-                let diffMap = try alignmentChecker.createDifferenceMap(reference: images[0], target: images[1])
+                let diffMap  = try aligner.createDifferenceMap(reference: images[0], target: images[1])
                 let diffPath = outputPath.replacingOccurrences(of: ".tiff", with: "_diff_0_1.tiff")
                 try imageLoader.saveTexture(diffMap, to: URL(fileURLWithPath: diffPath))
                 logger.info("   Saved difference map: \(diffPath)")
@@ -161,12 +178,14 @@ public final class StackProcessor {
         
         // Step 3.5: Color consistency normalization
         // Corrects per-frame exposure/luminance drift from focus breathing before blending.
+        progressHandler?(0.55, "Normalizing color consistency…")
         logger.info("Normalizing color consistency across frames...")
         let colorNormalizer = ColorConsistencyNormalizer(context: metalContext)
-        let normalizedImages = try colorNormalizer.normalize(images)
+        let normalizedImages = try colorNormalizer.normalize(alignedImages)
         logger.info("✓ Color consistency normalization complete")
         
         // Step 4: Perform blending
+        progressHandler?(0.65, "Blending \(images.count) images…")
         let result: MTLTexture
         if usePyramidBlending {
             logger.info("Performing PyBlend (Pyramid Blending)...")
@@ -181,9 +200,11 @@ public final class StackProcessor {
         }
         
         // Step 5: Save result
+        progressHandler?(0.95, "Saving result…")
         let outputURL = URL(fileURLWithPath: outputPath)
         try imageLoader.saveTexture(result, to: outputURL)
         
+        progressHandler?(1.00, "Complete!")
         logger.info("=== Pipeline complete! ===")
         logger.info("Result saved to: \(outputPath)")
     }

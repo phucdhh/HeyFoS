@@ -29,21 +29,22 @@ public class PyBlend {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid input"])
         }
         
-        let width = images[0].width
-        let _ = images[0].height // Suppress warning
+        let _ = images[0].width
         
         print("Pyramid blending: \(images.count) images, \(levels) levels")
                 // Step 0: Optimize focus maps significantly
         // This is critical - Laplacian is often too noisy. 
         // We will perform a heavy Gaussian blur on the focus maps to reduce noise
         // and create more coherent focus regions.
-        print("  [0/4] Pre-processing focus maps...")
+        print("  [0/4] Pre-processing focus maps (Gaussian pre-blur + guided filter)...")
         var processedFocusMaps: [MTLTexture] = []
-        for focusMap in focusMaps {
-            // Blur radius from params: higher = smoother weight transitions, less ringing.
-            // Quick Win default: 2.5 (was 8.0 hardcoded) for tighter focus boundaries.
+        for (i, focusMap) in focusMaps.enumerated() {
+            // Step A: Gaussian pre-blur to suppress high-frequency noise in focus scores.
             let blurred = try gaussianBlur(focusMap, radius: Float(blurRadius))
-            processedFocusMaps.append(blurred)
+            // Step B: Guided filter using the corresponding input image as guidance.
+            // This edge-preserving smoothing prevents ringing artifacts at focus boundaries.
+            let guided  = try guidedFilter(blurred, guidance: images[i], radius: 8, eps: 0.01)
+            processedFocusMaps.append(guided)
         }
         
         // Step 1: Normalize optimized focus maps
@@ -1084,5 +1085,151 @@ public class PyBlend {
         }
         
         return pixelData
+    }
+
+    // MARK: - Guided Filter (edge-preserving weight smoothing)
+
+    /// Applies a guided filter to the focus map `p` using `guidance` (an input image) as the
+    /// edge reference.  This preserves focus-region boundaries while eliminating noise/ringing in
+    /// the weight map — much better than a plain Gaussian blur for this purpose.
+    ///
+    /// - Parameters:
+    ///   - p:         Input focus/weight map (single-channel RGBA where R carries the value).
+    ///   - guidance:  Guiding image (RGBA32Float from the same frame).
+    ///   - radius:    Box-filter half-width (in pixels). Higher → smoother but less edge-aware.
+    ///   - eps:       Regularisation parameter. Smaller → sharper edges preserved.
+    private func guidedFilter(_ p: MTLTexture, guidance: MTLTexture, radius: Int = 8, eps: Float = 0.01) throws -> MTLTexture {
+        let w = p.width, h = p.height
+        let boxW = radius * 2 + 1
+
+        // Helper: create a working RGBA32Float texture
+        func makeTex(_ ww: Int = w, _ hh: Int = h) -> MTLTexture? {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: ww, height: hh, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            return context.device.makeTexture(descriptor: d)
+        }
+        // Helper: box-filter one texture with MPS
+        func boxBlur(_ input: MTLTexture, into output: MTLTexture) {
+            let box = MPSImageBox(device: context.device, kernelWidth: boxW, kernelHeight: boxW)
+            guard let cmd = context.commandQueue.makeCommandBuffer() else { return }
+            box.encode(commandBuffer: cmd, sourceTexture: input, destinationTexture: output)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        }
+
+        // --- Guided filter 10-pass implementation ---
+        // 1. mean_I  = box(I)
+        // 2. mean_p  = box(p)
+        // 3. mean_Ip = box(I * p)   [via pixel-multiply Metal kernel]
+        // 4. mean_I2 = box(I * I)
+        // 5. var_I   = mean_I2 − mean_I²
+        // 6. cov_Ip  = mean_Ip − mean_I * mean_p
+        // 7. a       = cov_Ip / (var_I + eps)
+        // 8. b       = mean_p − a * mean_I
+        // 9. mean_a  = box(a)
+        // 10. mean_b = box(b)
+        // 11. q      = mean_a * I + mean_b
+
+        // Inline Metal kernel source for element-wise ops (one kernel handles many ops via a mode flag).
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        // mode 0: c = a * b (each channel independently)
+        // mode 1: c = a * b  (same — split just for clarity)
+        // mode 2: c = a - b * b   (variance: mean_X2 - mean_X^2)
+        // mode 3: c = a - b * c2  (covariance: mean_Ip - mean_I * mean_p)
+        // mode 4: c = a / (b + eps)
+        // mode 5: c = a - b * c2  (b  = mean_p, b*c2 = a * mean_I; b here is reused)
+        // mode 6: c = a * b + c2   (final: mean_a * I + mean_b)
+
+        struct Params { float eps; float padding[3]; };
+
+        kernel void pointwise(
+            texture2d<float, access::read>  A       [[texture(0)]],
+            texture2d<float, access::read>  B       [[texture(1)]],
+            texture2d<float, access::read>  C2      [[texture(2)]],
+            texture2d<float, access::write> Out     [[texture(3)]],
+            constant uint  &mode                    [[buffer(0)]],
+            constant Params &params                 [[buffer(1)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= Out.get_width() || gid.y >= Out.get_height()) return;
+            float4 a  = A.read(gid);
+            float4 b  = B.read(gid);
+            float4 c2 = C2.read(gid);
+            float4 result;
+            switch (mode) {
+                case 0:  result = a * b;               break; // I*p or I*I
+                case 1:  result = a - b * b;           break; // var_I = mean_I2 - mean_I^2
+                case 2:  result = a - b * c2;          break; // cov_Ip = mean_Ip - mean_I*mean_p
+                case 3:  result = a / (b + params.eps);break; // a = cov/var
+                case 4:  result = c2 - a * b;          break; // b_coeff = mean_p - a*mean_I
+                case 5:  result = a * b + c2;          break; // q = mean_a*I + mean_b
+                default: result = a;                   break;
+            }
+            result.a = 1.0;
+            Out.write(result, gid);
+        }
+        """
+        let lib = try context.device.makeLibrary(source: src, options: nil)
+        let fn  = lib.makeFunction(name: "pointwise")!
+        let pl  = try context.device.makeComputePipelineState(function: fn)
+
+        struct GFParams { var eps: Float; var pad: (Float,Float,Float) = (0,0,0) }
+        var gfp = GFParams(eps: eps)
+        let tgs = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (w+15)/16, height: (h+15)/16, depth: 1)
+
+        func dispatch(mode: UInt32, A: MTLTexture, B: MTLTexture, C2: MTLTexture? = nil, out: MTLTexture) throws {
+            guard let cmd = context.commandQueue.makeCommandBuffer(),
+                  let enc = cmd.makeComputeCommandEncoder() else { return }
+            let emptyDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: 1, height: 1, mipmapped: false)
+            emptyDesc.usage = [.shaderRead, .shaderWrite]
+            let dummy = C2 ?? context.device.makeTexture(descriptor: emptyDesc)!
+            enc.setComputePipelineState(pl)
+            enc.setTexture(A, index: 0)
+            enc.setTexture(B, index: 1)
+            enc.setTexture(dummy, index: 2)
+            enc.setTexture(out, index: 3)
+            var m = mode
+            enc.setBytes(&m, length: 4, index: 0)
+            enc.setBytes(&gfp, length: MemoryLayout<GFParams>.size, index: 1)
+            enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tgs)
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        }
+
+        guard let meanI  = makeTex(), let meanP  = makeTex(),
+              let Ip     = makeTex(), let meanIp = makeTex(),
+              let I2     = makeTex(), let meanI2 = makeTex(),
+              let varI   = makeTex(), let covIp  = makeTex(),
+              let aCoeff = makeTex(), let bCoeff = makeTex(),
+              let meanA  = makeTex(), let meanB  = makeTex(),
+              let output = makeTex() else {
+            // Fallback: return Gaussian-blurred version
+            return try gaussianBlur(p, radius: Float(radius) * 0.5)
+        }
+
+        boxBlur(guidance, into: meanI)   // mean_I
+        boxBlur(p,        into: meanP)   // mean_p
+
+        try dispatch(mode: 0, A: guidance, B: guidance, out: I2)   // I*I
+        try dispatch(mode: 0, A: guidance, B: p,        out: Ip)   // I*p
+        boxBlur(I2, into: meanI2)
+        boxBlur(Ip, into: meanIp)
+
+        try dispatch(mode: 1, A: meanI2, B: meanI,  out: varI)     // var_I   = mean_I2 - mean_I^2
+        try dispatch(mode: 2, A: meanIp, B: meanI, C2: meanP, out: covIp) // cov = mean_Ip - mean_I*mean_p
+
+        try dispatch(mode: 3, A: covIp, B: varI,   out: aCoeff)    // a = cov / (var + eps)
+        try dispatch(mode: 4, A: aCoeff, B: meanI, C2: meanP, out: bCoeff) // b = mean_p - a*mean_I
+
+        boxBlur(aCoeff, into: meanA)
+        boxBlur(bCoeff, into: meanB)
+
+        try dispatch(mode: 5, A: meanA, B: guidance, C2: meanB, out: output) // q = mean_a * I + mean_b
+        return output
     }
 }
