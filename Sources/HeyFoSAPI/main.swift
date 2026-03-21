@@ -92,6 +92,11 @@ func routes(_ app: Application) throws {
         let path = releaseDir + filename
         var res = req.fileio.streamFile(at: path)
         res.headers.replaceOrAdd(name: .cacheControl, value: "no-store, no-cache, must-revalidate")
+        // Force browser to download the file (not open it inline)
+        res.headers.replaceOrAdd(
+            name: .contentDisposition,
+            value: "attachment; filename=\"\(filename)\""
+        )
         return res
     }
 

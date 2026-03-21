@@ -77,7 +77,7 @@ struct ContentView: View {
         HStack {
             if let err = state.errorMessage {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-                Text(err).foregroundStyle(.secondary).lineLimit(1)
+                Text(err).foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
             } else {
                 Text(state.progressMessage).foregroundStyle(.secondary)
             }

@@ -175,7 +175,7 @@ public class PyBlend {
         let numLevels = laplacianPyramids[0].count
         var blendedPyramid: [MTLTexture] = []
         
-        for level in 0..<numLevels {
+                for level in 0..<numLevels {
             // Collect all Laplacian levels and weights for this level
             var laplacianLevels: [MTLTexture] = []
             var weightLevels: [MTLTexture] = []
@@ -186,7 +186,8 @@ public class PyBlend {
             }
             
             // Blend this level
-            let blended = try blendLevel(laplacianLevels: laplacianLevels, weightLevels: weightLevels)
+            let isBase = (level == numLevels - 1)
+            let blended = try blendLevel(laplacianLevels: laplacianLevels, weightLevels: weightLevels, isBase: isBase)
             blendedPyramid.append(blended)
         }
         
@@ -194,7 +195,7 @@ public class PyBlend {
     }
     
     /// Blend a single pyramid level using weighted accumulation on GPU
-    private func blendLevel(laplacianLevels: [MTLTexture], weightLevels: [MTLTexture]) throws -> MTLTexture {
+    private func blendLevel(laplacianLevels: [MTLTexture], weightLevels: [MTLTexture], isBase: Bool = false) throws -> MTLTexture {
         let width = laplacianLevels[0].width
         let height = laplacianLevels[0].height
         
@@ -222,6 +223,7 @@ public class PyBlend {
             texture2d<float, access::read> weight [[texture(1)]],
             texture2d<float, access::read_write> accValue [[texture(2)]],
             texture2d<float, access::read_write> accWeight [[texture(3)]],
+            constant bool &isBase [[buffer(0)]],
             uint2 gid [[thread_position_in_grid]])
         {
             if (gid.x >= accValue.get_width() || gid.y >= accValue.get_height()) {
@@ -230,14 +232,23 @@ public class PyBlend {
             
             float4 lapVal = laplacian.read(gid);
             float w = max(0.0f, weight.read(gid).r);
-            // w is already raised to exponent 2.5 in normalizeFocusMap.
-            // Do NOT square again here — effective exponent would be ~5 → hard cutoffs → halos.
-
-            // Weighted-sum accumulation (true multi-resolution blending)
-            float4 curVal  = accValue.read(gid);
-            float  curW    = accWeight.read(gid).r;
-            accValue.write(curVal + lapVal * w, gid);
-            accWeight.write(float4(curW + w, 0.0, 0.0, 1.0), gid);
+            
+            if (isBase) {
+                // Base layer: Soft weighted average to prevent hard seams or glow patches
+                float4 curVal  = accValue.read(gid);
+                float  curW    = accWeight.read(gid).r;
+                accValue.write(curVal + lapVal * w, gid);
+                accWeight.write(float4(curW + w, 0.0, 0.0, 1.0), gid);
+            } else {
+                // Detail layers: Pure Winner-Takes-All on Laplacian energy. 
+                // Ignores blurred 'w' focus map entirely -> ZERO HALO.
+                float energy = dot(lapVal.rgb, lapVal.rgb);
+                float curMaxW = accWeight.read(gid).r;
+                if (energy > curMaxW) {
+                    accValue.write(lapVal, gid);
+                    accWeight.write(float4(energy, 0.0, 0.0, 1.0), gid);
+                }
+            }
         }
         
         kernel void finalize_level(
@@ -245,6 +256,7 @@ public class PyBlend {
             texture2d<float, access::read> accWeight [[texture(1)]],
             texture2d<float, access::write> output [[texture(2)]],
             constant uint &count [[buffer(0)]],
+            constant bool &isBase [[buffer(1)]],
             uint2 gid [[thread_position_in_grid]])
         {
             if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
@@ -253,10 +265,15 @@ public class PyBlend {
             
             float4 val = accValue.read(gid);
             float  w   = accWeight.read(gid).r;
-            // Normalize: divide by total weight (avoid artifacts from uncovered pixels)
-            float4 result = (w > 1e-7f) ? (val / w) : val;
-            result.a = 1.0;
-            output.write(result, gid);
+            
+            if (isBase) {
+                // Base layer used weighted sum, so we must normalize
+                val = (w > 1e-7f) ? (val / w) : val;
+            } 
+            // Detail layers used Winner-Takes-All, so val is already the exact winning pixel!
+            
+            val.a = 1.0;
+            output.write(val, gid);
         }
         """
         
@@ -280,6 +297,7 @@ public class PyBlend {
         )
         
         // Batch accumulation commands
+        var baseFlag = isBase
         for i in 0..<laplacianLevels.count {
             guard let encoder = commandBuffer.makeComputeCommandEncoder() else { continue }
             encoder.setComputePipelineState(accumulatePipeline)
@@ -287,6 +305,7 @@ public class PyBlend {
             encoder.setTexture(weightLevels[i], index: 1)
             encoder.setTexture(accValueTexture, index: 2)
             encoder.setTexture(accWeightTexture, index: 3)
+            encoder.setBytes(&baseFlag, length: MemoryLayout<Bool>.stride, index: 0)
             encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
             encoder.endEncoding()
         }
@@ -307,6 +326,8 @@ public class PyBlend {
         // Optional debugging count buffer (not currently used by shader logic but good practice to pass info)
         var count = UInt32(laplacianLevels.count)
         encoder.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 0)
+        var baseFlagFinal = isBase
+        encoder.setBytes(&baseFlagFinal, length: MemoryLayout<Bool>.stride, index: 1)
         
         encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()

@@ -130,7 +130,8 @@ struct SettingsPanel: View {
             Text(message)
                 .font(.caption)
                 .foregroundStyle(.primary)
-                .lineLimit(4)
+                .textSelection(.enabled) // Allows user to copy the error text
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(10)
         .background(Color.red.opacity(0.12))

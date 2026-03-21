@@ -149,12 +149,17 @@ ZIP_SIZE=$(du -sh "$ZIP_NAME" | cut -f1)
 echo "  ✓ Archive: release/$ZIP_NAME ($ZIP_SIZE)"
 cd "$SCRIPT_DIR"
 
-# ── 7. Substitute index.html template (Vapor serves from release/) ────────────
+# ── 7. Generate index.html from template (never modifies the template) ───────
 echo ""
-echo "▸ Generating release/index.html…"
-sed -i '' "s/__ZIP_NAME__/${ZIP_NAME}/g;s/__VERSION__/${VERSION}/g" \
-    "$RELEASE_DIR/index.html"
-echo "  ✓ release/index.html ready (href → ${ZIP_NAME})"
+echo "▸ Generating release/index.html from template…"
+TEMPLATE="$RELEASE_DIR/index.html.template"
+if [ ! -f "$TEMPLATE" ]; then
+    echo "  ✗ Template not found at $TEMPLATE"
+    exit 1
+fi
+sed "s/__ZIP_NAME__/${ZIP_NAME}/g;s/__VERSION__/${VERSION}/g" \
+    "$TEMPLATE" > "$RELEASE_DIR/index.html"
+echo "  ✓ release/index.html generated (href → ${ZIP_NAME})"
 
 # ── 8. Copy to frontend/build/release (static fallback) ─────────────────────
 echo ""
