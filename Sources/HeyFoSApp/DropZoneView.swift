@@ -1,153 +1,205 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Left panel: drop zone when empty, file list when images are loaded.
-struct DropZoneView: View {
+/// Left sidebar panel — Input Files (top) + Output Images (bottom).
+/// Mimics the ZereneStacker two-list sidebar layout.
+struct SidebarPanel: View {
     @ObservedObject var state: ProcessingState
-    @State private var isTargeted = false
+    @State private var isDragging = false
 
     var body: some View {
-        ZStack {
-            if state.imageFiles.isEmpty {
-                emptyDropZone
-            } else {
-                fileList
-            }
-        }
-        .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
-            handleDrop(providers)
-        }
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(
-                    isTargeted ? Color.accentColor : Color.clear,
-                    style: StrokeStyle(lineWidth: 2, dash: [6])
-                )
-                .padding(4)
-        )
-    }
-
-    // MARK: Empty drop zone
-    private var emptyDropZone: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "photo.stack")
-                .font(.system(size: 64))
-                .foregroundStyle(.secondary)
-            Text("Drop Images or Folder Here")
-                .font(.title2)
-                .fontWeight(.medium)
-            Text("Supports RAW (CR2, CR3, NEF, ARW, DNG…), TIFF, JPEG, PNG")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            HStack(spacing: 12) {
-                Button(action: openFilePanel) {
-                    Label("Add Files…", systemImage: "plus")
-                }
-                Button(action: openFolderPanel) {
-                    Label("Open Folder…", systemImage: "folder")
-                }
-            }
-            .buttonStyle(.bordered)
-        }
-        .padding(40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(
-                    Color.secondary.opacity(0.3),
-                    style: StrokeStyle(lineWidth: 1.5, dash: [6])
-                )
-        )
-        .padding()
-    }
-
-    // MARK: File list
-    private var fileList: some View {
         VStack(spacing: 0) {
-            // Header bar
-            HStack {
-                Image(systemName: "photo.stack.fill")
-                    .foregroundStyle(Color.accentColor)
-                Text("\(state.imageFiles.count) images loaded")
-                    .font(.headline)
+            inputFilesSection
+            Divider()
+            outputImagesSection
+        }
+        .onDrop(of: [.fileURL], isTargeted: $isDragging) { handleDrop($0) }
+        .overlay(
+            isDragging
+                ? Rectangle().strokeBorder(Color.accentColor, lineWidth: 2)
+                : nil
+        )
+        .background(Color(NSColor.controlBackgroundColor))
+    }
+
+    // MARK: - Input Files section
+
+    private var inputFilesSection: some View {
+        VStack(spacing: 0) {
+            // Header row
+            HStack(spacing: 4) {
+                Text("Input Files")
+                    .font(.system(size: 11, weight: .bold))
                 Spacer()
-                Button(action: openFilePanel) {
-                    Image(systemName: "plus")
+                Toggle(isOn: $state.showAsAdjusted) {
+                    Text("Show as adjusted")
+                        .font(.system(size: 11))
                 }
-                .buttonStyle(.borderless)
-                Button(action: { state.clearAll() }) {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.red)
+                .toggleStyle(.checkbox)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Color(NSColor.windowBackgroundColor))
 
             Divider()
 
-            List {
-                ForEach(Array(state.imageFiles.enumerated()), id: \.element) { idx, url in
-                    HStack(spacing: 10) {
-                        fileIcon(for: url)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(url.lastPathComponent)
-                                .font(.system(.body, design: .monospaced))
-                                .lineLimit(1)
-                            Text(url.deletingLastPathComponent().path)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        Spacer()
-                        Text("#\(idx + 1)")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                    .padding(.vertical, 2)
-                }
-                .onDelete { state.removeImages(at: $0) }
+            if state.imageFiles.isEmpty {
+                emptyDropHint
+            } else {
+                inputFileList
             }
-            .listStyle(.inset)
+        }
+        .frame(minHeight: 120)
+    }
+
+    private var emptyDropHint: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "photo.stack")
+                .font(.system(size: 28))
+                .foregroundStyle(.tertiary)
+            Text("Drop images or folder here")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            HStack(spacing: 6) {
+                Button("Add Files…") { state.showAddFilesPanel() }
+                    .controlSize(.small)
+                Button("Folder…") { state.showAddFolderPanel() }
+                    .controlSize(.small)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(12)
+    }
+
+    private var inputFileList: some View {
+        List(selection: $state.selectedInputIndex) {
+            ForEach(Array(state.imageFiles.enumerated()), id: \.offset) { idx, url in
+                Text(url.lastPathComponent)
+                    .tag(idx)
+                    .font(.system(size: 12))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(1)
+                    .help(url.path)
+                    .contextMenu {
+                        Button("Remove from List") {
+                            state.imageFiles.remove(at: idx)
+                        }
+                        Divider()
+                        Button("Reveal in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        }
+                    }
+            }
+        }
+        .listStyle(.inset)
+        .onChange(of: state.selectedInputIndex) { _, new in state.loadThumbnail(at: new) }
+        // Footer: file count + add button
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack(spacing: 0) {
+                Text("\(state.imageFiles.count) file\(state.imageFiles.count == 1 ? "" : "s")")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 8)
+                Spacer()
+                Button {
+                    state.showAddFilesPanel()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.borderless)
+                .padding(.trailing, 6)
+                Button {
+                    state.clearInputFiles()
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.red.opacity(0.8))
+                .disabled(state.imageFiles.isEmpty)
+                .padding(.trailing, 6)
+            }
+            .frame(height: 22)
+            .background(Color(NSColor.windowBackgroundColor))
+            .overlay(Divider(), alignment: .top)
         }
     }
 
-    private func fileIcon(for url: URL) -> some View {
-        let ext = url.pathExtension.lowercased()
-        let isRaw = ["cr2","cr3","nef","arw","dng","rw2","orf"].contains(ext)
-        return Image(systemName: isRaw ? "camera.aperture" : "photo")
-            .foregroundStyle(isRaw ? Color.orange : Color.accentColor)
-            .frame(width: 20)
-    }
+    // MARK: - Output Images section
 
-    // MARK: File picking
-    private func openFilePanel() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowedContentTypes = [.image, .tiff, .jpeg, .png,
-            UTType(filenameExtension: "cr2")!, UTType(filenameExtension: "cr3")!,
-            UTType(filenameExtension: "nef")!, UTType(filenameExtension: "arw")!,
-            UTType(filenameExtension: "dng")!, UTType(filenameExtension: "rw2")!,
-            UTType(filenameExtension: "orf")!]
-        panel.begin { response in
-            if response == .OK { state.addImages(from: panel.urls) }
+    private var outputImagesSection: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Output Images")
+                    .font(.system(size: 11, weight: .bold))
+                Spacer()
+                Button {
+                    guard let idx = state.selectedOutputIndex else { return }
+                    state.outputImages.remove(at: idx)
+                    if state.outputImages.isEmpty {
+                        state.selectedOutputIndex = nil
+                    } else {
+                        state.selectedOutputIndex = min(idx, state.outputImages.count - 1)
+                    }
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.red.opacity(0.8))
+                .disabled(state.selectedOutputIndex == nil)
+                .help("Remove selected output image from list")
+                .padding(.trailing, 6)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Color(NSColor.windowBackgroundColor))
+
+            Divider()
+
+            if state.outputImages.isEmpty {
+                Text("No output yet")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(.vertical, 24)
+            } else {
+                List(selection: $state.selectedOutputIndex) {
+                    ForEach(Array(state.outputImages.enumerated()), id: \.offset) { idx, entry in
+                        Text(entry.displayName)
+                            .font(.system(size: 11))
+                            .tag(idx)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .lineLimit(1)
+                            .help(entry.url.path)
+                            .contextMenu {
+                                Button("Open in Preview") {
+                                    NSWorkspace.shared.open(entry.url)
+                                }
+                                Button("Reveal in Finder") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([entry.url])
+                                }
+                                Divider()
+                                Button("Remove from List") {
+                                    state.outputImages.remove(at: idx)
+                                    if state.selectedOutputIndex == idx {
+                                        state.selectedOutputIndex = state.outputImages.isEmpty ? nil : max(0, idx - 1)
+                                    }
+                                }
+                            }
+                    }
+                }
+                .listStyle(.inset)
+            }
         }
+        .frame(minHeight: 80)
     }
 
-    private func openFolderPanel() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.begin { response in
-            if response == .OK { state.addImages(from: panel.urls) }
-        }
-    }
+    // MARK: - Drop handling
 
-    // MARK: Drop handling
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         var urls: [URL] = []
         let group = DispatchGroup()
@@ -155,7 +207,8 @@ struct DropZoneView: View {
             group.enter()
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                 defer { group.leave() }
-                if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                if let data = item as? Data,
+                   let url = URL(dataRepresentation: data, relativeTo: nil) {
                     urls.append(url)
                 }
             }
@@ -164,3 +217,6 @@ struct DropZoneView: View {
         return true
     }
 }
+
+// Keep DropZoneView as a typealias so any existing references still compile.
+typealias DropZoneView = SidebarPanel

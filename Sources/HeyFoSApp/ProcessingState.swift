@@ -2,6 +2,21 @@ import Foundation
 import AppKit
 import HeyFoSCore
 
+// MARK: – Output image record
+struct OutputImageEntry: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let methodLabel: String  // "PMax", "DMap", "Ensemble"
+    let url: URL
+    var nsImage: NSImage?
+
+    var displayName: String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd-HH.mm.ss"
+        return "\(fmt.string(from: timestamp)) HF \(methodLabel)"
+    }
+}
+
 // MARK: – Settings snapshot (passed to background thread)
 struct ProcessingSettings {
     let imageFiles: [URL]
@@ -11,6 +26,7 @@ struct ProcessingSettings {
     let blurRadius: Double
     let useAlignment: Bool
     let outputPath: String
+    let methodLabel: String
 }
 
 // MARK: – Main state object (all Published vars updated on main thread)
@@ -19,19 +35,27 @@ final class ProcessingState: ObservableObject {
     // UI state
     @Published var imageFiles: [URL] = []
     @Published var isProcessing: Bool = false
-    @Published var showResult: Bool = false
     @Published var progress: Double = 0
     @Published var progressMessage: String = "Ready"
     @Published var outputURL: URL? = nil
-    @Published var resultImage: NSImage? = nil
     @Published var errorMessage: String? = nil
 
+    // ZereneStacker-style lists
+    @Published var outputImages: [OutputImageEntry] = []
+    @Published var selectedInputIndex: Int? = nil
+    @Published var selectedOutputIndex: Int? = nil
+    @Published var showAsAdjusted: Bool = false
+    @Published var inputThumbnail: NSImage? = nil
+
+    // Sheet state
+    @Published var showPreferences: Bool = false
+
     // Settings
-    @Published var method: FocusMethod = .ensemble
+    @Published var method: FocusMethod = .tenengrad
     @Published var usePyramidBlending: Bool = true
     @Published var pyramidLevels: Int = 5
     @Published var blurRadius: Double = 2.5
-    @Published var useAlignment: Bool = true
+    @Published var useAlignment: Bool = false
     @Published var outputPath: String = {
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
         return (desktop ?? URL(fileURLWithPath: NSHomeDirectory()))
@@ -90,14 +114,104 @@ final class ProcessingState: ObservableObject {
         imageFiles.remove(atOffsets: offsets)
     }
 
+    // Computed label for current method settings
+    var currentMethodLabel: String {
+        switch (method, usePyramidBlending) {
+        case (.ensemble, true): return "PMax"
+        case (.laplacian, _), (.tenengrad, _): return "DMap"
+        default: return "Ensemble"
+        }
+    }
+
     func clearAll() {
         imageFiles = []
+        outputImages = []
         outputURL = nil
-        resultImage = nil
         errorMessage = nil
         progress = 0
         progressMessage = "Ready"
-        showResult = false
+        selectedInputIndex = nil
+        selectedOutputIndex = nil
+        inputThumbnail = nil
+    }
+
+    // MARK: – Convenience stacking shortcuts
+    func startStackingPMax() {
+        method = .ensemble
+        usePyramidBlending = true
+        // useAlignment is left as-is — respects the user's Preferences setting
+        startProcessing()
+    }
+
+    func startStackingDMap() {
+        method = .laplacian
+        usePyramidBlending = false
+        // useAlignment is left as-is — respects the user's Preferences setting
+        startProcessing()
+    }
+
+    // Clears only input files (not output results)
+    func clearInputFiles() {
+        imageFiles = []
+        selectedInputIndex = nil
+        inputThumbnail = nil
+        errorMessage = nil
+        progress = 0
+        progressMessage = "Ready"
+    }
+
+    // MARK: – Thumbnail loading
+    func loadThumbnail(at index: Int?) {
+        guard let idx = index, idx < imageFiles.count else {
+            inputThumbnail = nil
+            return
+        }
+        let url = imageFiles[idx]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let opts: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+                kCGImageSourceThumbnailMaxPixelSize: 1600
+            ]
+            var img: NSImage? = nil
+            if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
+                img = NSImage(cgImage: cg, size: .zero)
+            }
+            DispatchQueue.main.async {
+                if self?.selectedInputIndex == idx {
+                    self?.inputThumbnail = img
+                }
+            }
+        }
+    }
+
+    // MARK: – File picker panels (called from main thread)
+    func showAddFilesPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [
+            .image, .tiff, .jpeg, .png,
+            .init(filenameExtension: "cr2")!, .init(filenameExtension: "cr3")!,
+            .init(filenameExtension: "nef")!, .init(filenameExtension: "arw")!,
+            .init(filenameExtension: "dng")!, .init(filenameExtension: "rw2")!,
+            .init(filenameExtension: "orf")!
+        ]
+        panel.begin { [weak self] response in
+            if response == .OK { self?.addImages(from: panel.urls) }
+        }
+    }
+
+    func showAddFolderPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.begin { [weak self] response in
+            if response == .OK { self?.addImages(from: panel.urls) }
+        }
     }
 
     // MARK: – Processing
@@ -108,6 +222,17 @@ final class ProcessingState: ObservableObject {
         progress = 0
         progressMessage = "Preparing…"
 
+        // Auto-generate output path with timestamp + method if using default name
+        let label = currentMethodLabel
+        var resolvedOutput = outputPath
+        if resolvedOutput.hasSuffix("heyfos_result.tiff") {
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyy-MM-dd-HH.mm.ss"
+            let ts = fmt.string(from: Date())
+            let dir = URL(fileURLWithPath: resolvedOutput).deletingLastPathComponent()
+            resolvedOutput = dir.appendingPathComponent("\(ts)-HF-\(label).tiff").path
+        }
+
         let settings = ProcessingSettings(
             imageFiles: imageFiles,
             method: method,
@@ -115,7 +240,8 @@ final class ProcessingState: ObservableObject {
             pyramidLevels: pyramidLevels,
             blurRadius: blurRadius,
             useAlignment: useAlignment,
-            outputPath: outputPath
+            outputPath: resolvedOutput,
+            methodLabel: label
         )
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -164,12 +290,18 @@ final class ProcessingState: ObservableObject {
                 // 5. Load result image for preview
                 let image = NSImage(contentsOf: outURL)
                 DispatchQueue.main.async {
+                    let entry = OutputImageEntry(
+                        timestamp: Date(),
+                        methodLabel: settings.methodLabel,
+                        url: outURL,
+                        nsImage: image
+                    )
+                    self.outputImages.append(entry)
+                    self.selectedOutputIndex = self.outputImages.count - 1
                     self.isProcessing = false
                     self.outputURL = outURL
-                    self.resultImage = image
                     self.progress = 1.0
-                    self.progressMessage = "Complete!"
-                    self.showResult = true
+                    self.progressMessage = "Complete! (\(entry.displayName))"
                 }
             } catch {
                 DispatchQueue.main.async {

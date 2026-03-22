@@ -1,85 +1,241 @@
 import SwiftUI
 import AppKit
 
-/// Full-window result viewer shown as a sheet after processing completes.
-struct ResultView: View {
+// MARK: - Dual Image Viewer (ZereneStacker-style main canvas)
+
+/// Shows two image viewer panels side-by-side: left = selected input, right = selected output.
+/// Collapses to a single panel until output images are available.
+struct DualImageViewer: View {
     @ObservedObject var state: ProcessingState
-    @Environment(\.dismiss) private var dismiss
+
+    private var leftTitle: String {
+        guard let idx = state.selectedInputIndex, idx < state.imageFiles.count else {
+            return state.imageFiles.first?.path ?? ""
+        }
+        return state.imageFiles[idx].path
+    }
+
+    private var rightTitle: String {
+        guard let idx = state.selectedOutputIndex, idx < state.outputImages.count else {
+            return state.outputImages.last?.url.path ?? ""
+        }
+        return state.outputImages[idx].url.path
+    }
+
+    private var rightImage: NSImage? {
+        if let idx = state.selectedOutputIndex, idx < state.outputImages.count {
+            return state.outputImages[idx].nsImage
+        }
+        return state.outputImages.last?.nsImage
+    }
+
+    var body: some View {
+        if state.outputImages.isEmpty {
+            // Single panel — shows selected input thumbnail or empty hint
+            ImageViewerPanel(
+                title: leftTitle,
+                image: state.inputThumbnail,
+                placeholder: state.imageFiles.isEmpty
+                    ? "Use File > Add Files… or drag images onto the sidebar\nto load a focus stack"
+                    : "Select a file from Input Files list to preview it"
+            )
+        } else {
+            HSplitView {
+                ImageViewerPanel(
+                    title: leftTitle,
+                    image: state.inputThumbnail,
+                    placeholder: "Select a file in Input Files"
+                )
+                ImageViewerPanel(
+                    title: rightTitle,
+                    image: rightImage,
+                    placeholder: "Select an output image"
+                )
+            }
+        }
+    }
+}
+
+// MARK: - Single image viewer panel
+
+struct ImageViewerPanel: View {
+    let title: String
+    let image: NSImage?
+    let placeholder: String
+
+    @State private var scale: PanelScale = .fitWindow
+    @State private var isMaximized = false
+    // Pinch / scroll-wheel zoom (multiplied on top of the scale picker)
+    @State private var magnifyScale: CGFloat = 1.0
+
+    enum PanelScale: String, CaseIterable, Identifiable {
+        case fitWindow = "Fit window"
+        case p25  = "25%"
+        case p50  = "50%"
+        case p100 = "100%"
+        case p200 = "200%"
+        var id: String { rawValue }
+
+        var factor: CGFloat? {
+            switch self {
+            case .fitWindow: return nil
+            case .p25:  return 0.25
+            case .p50:  return 0.5
+            case .p100: return 1.0
+            case .p200: return 2.0
+            }
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Toolbar
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Focus Stack Complete")
-                        .font(.headline)
-                    if let url = state.outputURL {
-                        Text(url.path)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-                Spacer()
-                Button("Open in Preview") {
-                    if let url = state.outputURL {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
-                .buttonStyle(.bordered)
-                Button("Reveal in Finder") {
-                    if let url = state.outputURL {
-                        NSWorkspace.shared.activateFileViewerSelecting([url])
-                    }
-                }
-                .buttonStyle(.bordered)
-                Button("Close") { dismiss() }
-                    .buttonStyle(.borderedProminent)
-            }
-            .padding()
-
+            titleBar
             Divider()
-
-            // Image preview
-            if let image = state.resultImage {
-                ScrollView([.horizontal, .vertical]) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(
-                            minWidth: 400, maxWidth: .infinity,
-                            minHeight: 300, maxHeight: .infinity
-                        )
-                        .padding()
-                }
-                .background(Color(NSColor.underPageBackgroundColor))
-            } else {
-                ContentUnavailableView(
-                    "No preview available",
-                    systemImage: "photo",
-                    description: Text("The result was saved but could not be loaded for preview.")
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-
+            imageArea
             Divider()
-
-            // Stats footer
-            HStack {
-                Label("\(state.imageFiles.count) images stacked", systemImage: "photo.stack")
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let url = state.outputURL,
-                   let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-                   let size = attrs[.size] as? Int64 {
-                    Text("Output size: \(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .font(.caption)
-            .padding(.horizontal)
-            .padding(.vertical, 8)
+            scaleBar
         }
-        .frame(minWidth: 700, minHeight: 540)
+        .background(Color(NSColor.windowBackgroundColor))
+        // Reset magnify when picker changes
+        .onChange(of: scale) { _, _ in magnifyScale = 1.0 }
+    }
+
+    // MARK: Title bar (mimics ZereneStacker's MDI title bar)
+    private var titleBar: some View {
+        HStack(spacing: 6) {
+            Text(title.isEmpty ? "(no file)" : title)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            // Minimise-like icon
+            Button {
+                isMaximized.toggle()
+            } label: {
+                Image(systemName: isMaximized
+                      ? "arrow.down.right.and.arrow.up.left"
+                      : "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 9, weight: .medium))
+            }
+            .buttonStyle(.borderless)
+            .help(isMaximized ? "Restore" : "Maximise")
+            // External open icon
+            Button {
+                if !title.isEmpty {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: title))
+                }
+            } label: {
+                Image(systemName: "arrow.up.right.square")
+                    .font(.system(size: 9, weight: .medium))
+            }
+            .buttonStyle(.borderless)
+            .help("Open in Preview")
+            .disabled(title.isEmpty)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    // MARK: Image area
+    private var imageArea: some View {
+        ZStack {
+            Color(red: 0.08, green: 0.08, blue: 0.08)
+                .ignoresSafeArea()
+
+            if let img = image {
+                GeometryReader { geo in
+                    ScrollView([.horizontal, .vertical]) {
+                        Image(nsImage: img)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(
+                                width:  imageWidth(img: img, in: geo),
+                                height: imageHeight(img: img, in: geo)
+                            )
+                            // Keep image centred when smaller than the scroll view
+                            .frame(
+                                minWidth: geo.size.width,
+                                minHeight: geo.size.height
+                            )
+                    }
+                    // Pinch-to-zoom (trackpad) — clamp to reasonable range
+                    .gesture(
+                        MagnifyGesture()
+                            .onChanged { value in
+                                magnifyScale = min(max(value.magnification, 0.1), 20)
+                            }
+                            .onEnded { value in
+                                magnifyScale = min(max(value.magnification, 0.1), 20)
+                            }
+                    )
+                }
+            } else {
+                Text(placeholder)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.white.opacity(0.35))
+                    .multilineTextAlignment(.center)
+                    .padding(24)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func imageWidth(img: NSImage, in geo: GeometryProxy) -> CGFloat {
+        if scale == .fitWindow {
+            return geo.size.width * magnifyScale
+        }
+        let factor = scale.factor ?? 1.0
+        return img.size.width * factor * magnifyScale
+    }
+
+    private func imageHeight(img: NSImage, in geo: GeometryProxy) -> CGFloat {
+        if scale == .fitWindow {
+            return geo.size.height * magnifyScale
+        }
+        let factor = scale.factor ?? 1.0
+        return img.size.height * factor * magnifyScale
+    }
+
+    // MARK: Scale bar (bottom strip, exactly like ZereneStacker)
+    private var scaleBar: some View {
+        HStack(spacing: 6) {
+            Text("Scale")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Picker("", selection: $scale) {
+                ForEach(PanelScale.allCases) { s in
+                    Text(s.rawValue).tag(s)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .frame(width: 116)
+            .font(.system(size: 11))
+
+            if magnifyScale != 1.0 {
+                Text("× \(magnifyScale, specifier: "%.2f")")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Button("Reset") { magnifyScale = 1.0 }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.accentColor)
+            }
+
+            Spacer()
+            if let img = image {
+                Text("\(Int(img.size.width)) × \(Int(img.size.height))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color(NSColor.windowBackgroundColor))
     }
 }
+
+// Keep old name so any lingering reference compiles.
+typealias ResultView = DualImageViewer

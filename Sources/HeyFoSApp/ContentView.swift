@@ -5,90 +5,75 @@ struct ContentView: View {
 
     var body: some View {
         HSplitView {
-            // Left: file drop / file list
-            DropZoneView(state: state)
-                .frame(minWidth: 400)
+            // Left sidebar: Input Files + Output Images
+            SidebarPanel(state: state)
+                .frame(minWidth: 190, idealWidth: 240, maxWidth: 300)
 
-            // Right: settings
-            SettingsPanel(state: state)
-                .frame(minWidth: 260, maxWidth: 320)
+            // Right: dual image viewers
+            DualImageViewer(state: state)
+                .frame(minWidth: 560)
         }
-        // Progress overlay while processing
-        .overlay {
+        .overlay(alignment: .bottom) {
             if state.isProcessing {
-                processingOverlay
+                processingBar
             }
         }
-        // Result sheet
-        .sheet(isPresented: $state.showResult) {
-            ResultView(state: state)
+        .sheet(isPresented: $state.showPreferences) {
+            SettingsPanel(state: state)
+                .frame(minWidth: 380, minHeight: 420)
         }
-        // Status bar
         .safeAreaInset(edge: .bottom) {
             statusBar
         }
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                if !state.imageFiles.isEmpty && !state.isProcessing {
-                    Button {
-                        state.clearAll()
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise")
-                    }
-                    .help("Clear all images and start over")
-                }
-            }
-        }
+        .focusedObject(state)
     }
 
-    // MARK: Processing overlay
-    private var processingOverlay: some View {
-        ZStack {
-            Color.black.opacity(0.35)
-                .ignoresSafeArea()
-            VStack(spacing: 20) {
-                ProgressView(value: state.progress)
-                    .progressViewStyle(.linear)
-                    .frame(width: 320)
-                    .tint(.accentColor)
-
-                Text(state.progressMessage)
-                    .font(.headline)
-                    .foregroundStyle(.white)
-
-                Text("\(Int(state.progress * 100))%")
-                    .font(.system(.title, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.8))
-
-                Button("Cancel") {
-                    state.cancelProcessing()
-                }
+    // MARK: Processing bar (inline, not full overlay)
+    private var processingBar: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .scaleEffect(0.7)
+            ProgressView(value: state.progress)
+                .progressViewStyle(.linear)
+                .frame(width: 200)
+                .tint(.accentColor)
+            Text(state.progressMessage)
+                .font(.system(size: 11))
+                .foregroundStyle(.white)
+            Spacer()
+            Button("Cancel") { state.cancelProcessing() }
                 .buttonStyle(.bordered)
+                .controlSize(.small)
                 .tint(.red)
-            }
-            .padding(32)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
-            .shadow(radius: 20)
         }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .background(Color(NSColor.windowBackgroundColor).opacity(0.95))
+        .shadow(radius: 4, y: -2)
     }
 
     // MARK: Status bar
     private var statusBar: some View {
-        HStack {
+        HStack(spacing: 6) {
             if let err = state.errorMessage {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-                Text(err).foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                Text(err)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .textSelection(.enabled)
             } else {
-                Text(state.progressMessage).foregroundStyle(.secondary)
+                Text(state.progressMessage)
+                    .foregroundStyle(.secondary)
             }
             Spacer()
-            Text("HeyFoS v1.0.0 · Apple Silicon")
+            Text("HeyFoS · Apple Silicon")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
         .font(.caption)
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.vertical, 5)
         .background(.bar)
     }
 }
