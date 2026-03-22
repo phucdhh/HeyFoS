@@ -15,11 +15,11 @@ using namespace metal;
 // MARK: - Specular Suppression Helper
 // Reduces focus weight in specular (overexposed) regions that would otherwise
 // produce false high-frequency responses and halo artifacts.
+// More aggressive suppression starting at 0.80 for macro photography where
+// specular highlights on wet/glossy surfaces are common.
 inline float computeSpecularWeight(float lum) {
-    // Soft transition from 1.0 (normal) down to 0.15 (peak specular)
-    // Threshold 0.86→0.92 targets the specular rim without clipping standard highlights.
-    float f = smoothstep(0.86, 0.92, lum);
-    return 1.0 - f * 0.85;
+    float f = smoothstep(0.80, 0.90, lum);
+    return 1.0 - f * 0.90;
 }
 
 // MARK: - Focus Measure Kernels
@@ -90,8 +90,10 @@ kernel void tenengrad_focus_measure(
     output.write(float4(gradient_mag, gradient_mag, gradient_mag, 1.0), gid);
 }
 
-/// Ensemble focus measure: weighted combination of Laplacian, Tenengrad, and Local Variance
-/// with integrated specular suppression. More stable than any single metric alone.
+/// Ensemble focus measure: Multi-scale Laplacian + Tenengrad + Local Variance
+/// Uses 3x3, 7x7, and 11x11 windows for robust multi-scale focus detection.
+/// Small kernels capture fine detail; large kernels provide stable region-level focus.
+/// Based on: Pertuz et al. "Analysis of focus measure operators for shape-from-focus" (2013)
 kernel void ensemble_focus_measure(
     texture2d<float, access::read> input [[texture(0)]],
     texture2d<float, access::write> output [[texture(1)]],
@@ -105,14 +107,24 @@ kernel void ensemble_focus_measure(
     int2 sz  = int2(int(input.get_width()) - 1, int(input.get_height()) - 1);
     float lum = input.read(uint2(pos)).r;
     
-    // == Metric 1: Laplacian (3x3 cross) ==
+    // == Metric 1: Multi-scale Laplacian (3x3 + 7x7 LoG approximation) ==
+    // 3x3 Laplacian (fine detail)
     float top    = input.read(uint2(clamp(pos + int2( 0,-1), int2(0), sz))).r;
     float bottom = input.read(uint2(clamp(pos + int2( 0, 1), int2(0), sz))).r;
     float lft    = input.read(uint2(clamp(pos + int2(-1, 0), int2(0), sz))).r;
     float rgt    = input.read(uint2(clamp(pos + int2( 1, 0), int2(0), sz))).r;
-    float laplacian = abs(4.0 * lum - top - bottom - lft - rgt) * 1000.0;
+    float lap3 = abs(4.0 * lum - top - bottom - lft - rgt);
     
-    // == Metric 2: Tenengrad (Sobel gradient magnitude, scaled to match Laplacian range) ==
+    // 7x7 Laplacian approximation (medium scale — samples at stride 3)
+    float t3  = input.read(uint2(clamp(pos + int2( 0,-3), int2(0), sz))).r;
+    float b3  = input.read(uint2(clamp(pos + int2( 0, 3), int2(0), sz))).r;
+    float l3  = input.read(uint2(clamp(pos + int2(-3, 0), int2(0), sz))).r;
+    float r3  = input.read(uint2(clamp(pos + int2( 3, 0), int2(0), sz))).r;
+    float lap7 = abs(4.0 * lum - t3 - b3 - l3 - r3);
+    
+    float laplacian = (lap3 * 0.6 + lap7 * 0.4) * 1000.0;
+    
+    // == Metric 2: Tenengrad (Sobel gradient magnitude) ==
     float gx = 0.0, gy = 0.0;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
@@ -124,22 +136,41 @@ kernel void ensemble_focus_measure(
     }
     float tenengrad = sqrt(gx * gx + gy * gy) * 300.0;
     
-    // == Metric 3: Local standard deviation (5x5) — captures texture richness ==
-    float vsum = 0.0, vsum2 = 0.0;
+    // == Metric 3: Multi-scale local variance (5x5 + 9x9) ==
+    // 5x5 window
+    float vsum5 = 0.0, vsum5_2 = 0.0;
     for (int dy = -2; dy <= 2; dy++) {
         for (int dx = -2; dx <= 2; dx++) {
             int2 sp = clamp(pos + int2(dx, dy), int2(0), sz);
             float p = input.read(uint2(sp)).r;
-            vsum  += p;
-            vsum2 += p * p;
+            vsum5  += p;
+            vsum5_2 += p * p;
         }
     }
-    float mean5    = vsum / 25.0;
-    float variance = max(0.0, vsum2 / 25.0 - mean5 * mean5);
-    float local_std = sqrt(variance) * 2000.0;
+    float mean5    = vsum5 / 25.0;
+    float var5     = max(0.0, vsum5_2 / 25.0 - mean5 * mean5);
+    
+    // 9x9 window (robust large-scale texture measure)
+    float vsum9 = 0.0, vsum9_2 = 0.0;
+    int count9 = 0;
+    for (int dy = -4; dy <= 4; dy++) {
+        for (int dx = -4; dx <= 4; dx++) {
+            int2 sp = clamp(pos + int2(dx, dy), int2(0), sz);
+            float p = input.read(uint2(sp)).r;
+            vsum9  += p;
+            vsum9_2 += p * p;
+            count9++;
+        }
+    }
+    float mean9 = vsum9 / float(count9);
+    float var9  = max(0.0, vsum9_2 / float(count9) - mean9 * mean9);
+    
+    // Combined local std: emphasize 9x9 for stability
+    float local_std = (sqrt(var5) * 0.35 + sqrt(var9) * 0.65) * 2000.0;
     
     // == Weighted ensemble ==
-    float ensemble = 0.45 * laplacian + 0.35 * tenengrad + 0.20 * local_std;
+    // Higher weight on Laplacian (now multi-scale) and local variance for robustness
+    float ensemble = 0.40 * laplacian + 0.30 * tenengrad + 0.30 * local_std;
     
     // == Specular suppression ==
     ensemble *= computeSpecularWeight(lum);

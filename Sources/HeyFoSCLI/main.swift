@@ -62,7 +62,7 @@ struct HeyFoSCLI: ParsableCommand {
             // Process real image stack
             logger.info("Processing image stack from directory...")
             
-            let focusMethod: FocusMeasureProcessor.Method = method == "tenengrad" ? .tenengrad : .laplacian
+            let focusMethod: FocusMeasureProcessor.Method = method == "tenengrad" ? .tenengrad : (method == "ensemble" ? .ensemble : .laplacian)
             
             try stackProcessor.processStack(
                 inputDirectory: inputURL,
@@ -95,7 +95,7 @@ struct HeyFoSCLI: ParsableCommand {
             // Compute focus measure
             let focusMap = try focusProcessor.computeFocusMeasure(
                 inputTexture: grayImage,
-                method: method == "tenengrad" ? .tenengrad : .laplacian
+                method: method == "tenengrad" ? .tenengrad : (method == "ensemble" ? .ensemble : .laplacian)
             )
             logger.info("✓ Focus measure computed")
             

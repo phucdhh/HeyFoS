@@ -87,7 +87,7 @@ public final class StackProcessor {
     /// Compute focus measures for all images in stack
     public func computeFocusMeasures(
         for textures: [MTLTexture],
-        method: FocusMeasureProcessor.Method = .laplacian
+        method: FocusMeasureProcessor.Method = .ensemble
     ) throws -> [MTLTexture] {
         logger.info("Computing focus measures for \(textures.count) images...")
         
@@ -119,8 +119,8 @@ public final class StackProcessor {
         method: FocusMeasureProcessor.Method = .ensemble,
         useAlignment: Bool = true,
         usePyramidBlending: Bool = true,
-        pyramidLevels: Int = 5,
-        blurRadius: Double = 2.5,
+        pyramidLevels: Int = 6,
+        blurRadius: Double = 1.5,
         verbose: Bool = false,
         progressHandler: ((Double, String) -> Void)? = nil
     ) throws {

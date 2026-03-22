@@ -51,10 +51,10 @@ final class ProcessingState: ObservableObject {
     @Published var showPreferences: Bool = false
 
     // Settings
-    @Published var method: FocusMethod = .tenengrad
+    @Published var method: FocusMethod = .ensemble
     @Published var usePyramidBlending: Bool = true
-    @Published var pyramidLevels: Int = 5
-    @Published var blurRadius: Double = 2.5
+    @Published var pyramidLevels: Int = 6
+    @Published var blurRadius: Double = 1.5
     @Published var useAlignment: Bool = false
     @Published var outputPath: String = {
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
