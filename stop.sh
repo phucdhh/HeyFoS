@@ -1,66 +1,28 @@
 #!/bin/bash
-
 # HeyFoS - Stop Script
-# Stops both backend and frontend servers
+# Stops all HeyFoS services via LaunchDaemons (requires sudo for launchctl).
 
-BACKEND_PORT=7070
-FRONTEND_PORT=7071
+LABELS=(
+    "com.heyfos.backend"
+    "com.heyfos.frontend"
+    "com.cloudflare.cloudflared.heyfos"
+)
+NAMES=("🔧 Backend" "🎨 Frontend" "🌐 Cloudflare Tunnel")
 
 echo "🛑 Stopping HeyFoS..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Stop backend
-if lsof -ti:$BACKEND_PORT >/dev/null 2>&1; then
-    echo "🔧 Stopping backend server (port $BACKEND_PORT)..."
-    lsof -ti:$BACKEND_PORT | xargs kill -TERM 2>/dev/null
-    
-    # Wait for graceful shutdown
-    sleep 2
-    
-    # Force kill if still running
-    if lsof -ti:$BACKEND_PORT >/dev/null 2>&1; then
-        echo "   Force killing backend..."
-        lsof -ti:$BACKEND_PORT | xargs kill -9 2>/dev/null
+for i in "${!LABELS[@]}"; do
+    label="${LABELS[$i]}"
+    name="${NAMES[$i]}"
+    echo -n "  ${name}: "
+    if sudo launchctl list "$label" &>/dev/null; then
+        sudo launchctl bootout "system/$label" 2>/dev/null && echo "✅ stopped" || echo "⚠️  already stopped"
+    else
+        echo "⚠️  not loaded"
     fi
-    echo "   Backend stopped ✅"
-else
-    echo "⚠️  Backend not running"
-fi
-
-# Stop frontend
-if lsof -ti:$FRONTEND_PORT >/dev/null 2>&1; then
-    echo "🎨 Stopping frontend server (port $FRONTEND_PORT)..."
-    lsof -ti:$FRONTEND_PORT | xargs kill -TERM 2>/dev/null
-    
-    # Wait for graceful shutdown
-    sleep 2
-    
-    # Force kill if still running
-    if lsof -ti:$FRONTEND_PORT >/dev/null 2>&1; then
-        echo "   Force killing frontend..."
-        lsof -ti:$FRONTEND_PORT | xargs kill -9 2>/dev/null
-    fi
-    echo "   Frontend stopped ✅"
-else
-    echo "⚠️  Frontend not running"
-fi
-
-# Stop Cloudflare tunnel
-if pgrep -f "config-heyfos.yml" >/dev/null 2>&1; then
-    echo "🌐 Stopping Cloudflare tunnel (heyfos)..."
-    pkill -f "config-heyfos.yml" 2>/dev/null || true
-    sleep 1
-    echo "   Tunnel stopped ✅"
-else
-    echo "⚠️  Tunnel not running"
-fi
-
-# Clean up any remaining node/npm processes related to heyfos
-pkill -f "heyfos-server" 2>/dev/null || true
-pkill -f "frontend.*npm start" 2>/dev/null || true
+done
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "✅ HeyFoS stopped successfully!"
-echo ""
-echo "💡 Start again with: ./start.sh"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✅ HeyFoS stopped."
+echo "   Start again with: ./start.sh"

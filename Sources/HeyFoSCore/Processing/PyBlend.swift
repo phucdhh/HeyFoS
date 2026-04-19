@@ -234,11 +234,14 @@ public class PyBlend {
             float w = max(0.0f, weight.read(gid).r);
             
             if (isBase) {
-                // Base layer: Soft weighted average to prevent hard seams or glow patches
-                float4 curVal  = accValue.read(gid);
-                float  curW    = accWeight.read(gid).r;
-                accValue.write(curVal + lapVal * w, gid);
-                accWeight.write(float4(curW + w, 0.0, 0.0, 1.0), gid);
+                // Base layer (Halo Fix): Instead of soft average which pulls background glow,
+                // we use Winner-Takes-All based on the smoothed weight map. This ensures
+                // only the most in-focus region provides the core brightness/color.
+                float curMaxW = accWeight.read(gid).r;
+                if (w > curMaxW) {
+                    accValue.write(lapVal, gid);
+                    accWeight.write(float4(w, 0.0, 0.0, 1.0), gid);
+                }
             } else {
                 // Detail layers: Pure Winner-Takes-All on Laplacian energy. 
                 // Ignores blurred 'w' focus map entirely -> ZERO HALO.
@@ -267,8 +270,8 @@ public class PyBlend {
             float  w   = accWeight.read(gid).r;
             
             if (isBase) {
-                // Base layer used weighted sum, so we must normalize
-                val = (w > 1e-7f) ? (val / w) : val;
+                // Base layer is now Winner-Takes-All, so no normalization is needed.
+                // Just write the winning value directly.
             } 
             // Detail layers used Winner-Takes-All, so val is already the exact winning pixel!
             
