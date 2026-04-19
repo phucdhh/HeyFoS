@@ -51,6 +51,20 @@ kernel void laplacian_focus_measure(
     // Suppress specular highlights that generate false high focus scores
     focus_score *= computeSpecularWeight(center);
     
+    // Giai đoạn 1: Ức chế lóa sáng OOF (Out-of-Focus Highlight Suppression)
+    // Nếu điểm trung tâm rất sáng (có lóa/blooming) nhưng sự chênh lệch chi tiết thấp (focus nhỏ),
+    // đánh tụt điểm để vùng lóa này không được đính lên lớp sắc nét bên dưới.
+    float normalized_focus = focus_score / 1000.0;
+    if (center > 0.65) {
+        if (normalized_focus < 0.05) {
+            focus_score *= 0.05; // 95% penalty
+        } else if (normalized_focus < 0.1) {
+            focus_score *= 0.2;  // 80% penalty
+        } else if (normalized_focus < 0.2) {
+            focus_score *= 0.5;  // 50% penalty
+        }
+    }
+    
     output.write(float4(focus_score, focus_score, focus_score, 1.0), gid);
 }
 

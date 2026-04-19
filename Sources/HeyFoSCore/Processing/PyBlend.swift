@@ -55,11 +55,11 @@ public class PyBlend {
             normalizedFocusMaps.append(normalized)
         }
 
-        // Step 1.5: Cross-normalize so weights sum to exactly 1 at every pixel.
-        // CRITICAL for halo removal: without this, at background/edge pixels where all
-        // focus scores are near 0, finalize_level divides ~0 by ~0 → amplified noise → bright halos.
-        print("  [1.5/4] Cross-normalizing weights across images...")
-        normalizedFocusMaps = try crossNormalizeWeights(normalizedFocusMaps)
+        // Step 1.5: Binarize weights (Strict Winner-Takes-All)
+        // Giai đoạn 2: Áp đặt cơ chế "Winner-Takes-All" tuyệt đối. 
+        // Chỉ giữ lại mask = 1.0 cho pixel nét nhất, các pixel khác = 0.0.
+        print("  [1.5/4] Binarizing weights across images...")
+        normalizedFocusMaps = try binarizeWeights(normalizedFocusMaps)
                 // Step 1: Build Gaussian pyramids for each image
         print("  [1/4] Building Gaussian pyramids...")
         var gaussianPyramids: [[MTLTexture]] = []
@@ -244,8 +244,14 @@ public class PyBlend {
                 }
             } else {
                 // Detail layers: Pure Winner-Takes-All on Laplacian energy. 
-                // Ignores blurred 'w' focus map entirely -> ZERO HALO.
+                // Giai đoạn 3: Lọc tần số không gian (High-pass threshold)
+                // Lọc bỏ nhiễu nền rác. Nếu năng lượng quá bé, đây là vùng background mờ đen cần triệt tiêu.
                 float energy = dot(lapVal.rgb, lapVal.rgb);
+                
+                if (energy < 0.0005f) {
+                    return; // Dưới ngưỡng nhiễu, giữ cho laplacian tích lũy ở mức 0
+                }
+                
                 float curMaxW = accWeight.read(gid).r;
                 if (energy > curMaxW) {
                     accValue.write(lapVal, gid);
@@ -363,9 +369,9 @@ public class PyBlend {
         cmd.commit()
     }
     
-    /// Cross-normalize weight maps so they sum to 1 at every pixel.
-    /// This is the fundamental requirement for halo-free multi-image Laplacian blending.
-    private func crossNormalizeWeights(_ weights: [MTLTexture]) throws -> [MTLTexture] {
+    /// Binarize focused areas (Strict Winner-Takes-All).
+    /// Giai đoạn 2: Áp đặt cơ chế "Winner-Takes-All" tuyệt đối.
+    private func binarizeWeights(_ weights: [MTLTexture]) throws -> [MTLTexture] {
         guard weights.count > 1 else { return weights }
         let width = weights[0].width
         let height = weights[0].height
@@ -374,66 +380,69 @@ public class PyBlend {
         #include <metal_stdlib>
         using namespace metal;
 
-        // Accumulate R channel of each weight map into a running sum
-        kernel void accum_sum(
+        kernel void compute_max_weight(
             texture2d<float, access::read>       weight [[texture(0)]],
-            texture2d<float, access::read_write> sum    [[texture(1)]],
+            texture2d<float, access::read_write> maxW   [[texture(1)]],
             uint2 gid [[thread_position_in_grid]])
         {
-            if (gid.x >= sum.get_width() || gid.y >= sum.get_height()) return;
+            if (gid.x >= maxW.get_width() || gid.y >= maxW.get_height()) return;
             float w = max(0.0f, weight.read(gid).r);
-            float s = sum.read(gid).r;
-            sum.write(float4(s + w, 0, 0, 1), gid);
+            float currentMax = maxW.read(gid).r;
+            if (w > currentMax) {
+                maxW.write(float4(w, 0.0f, 0.0f, 1.0f), gid);
+            }
         }
 
-        // Divide each weight by its pixel’s total sum; output all channels equal
-        kernel void div_by_sum(
+        kernel void compare_max(
             texture2d<float, access::read>  weight [[texture(0)]],
-            texture2d<float, access::read>  sum    [[texture(1)]],
+            texture2d<float, access::read>  maxW   [[texture(1)]],
             texture2d<float, access::write> output [[texture(2)]],
             uint2 gid [[thread_position_in_grid]])
         {
             if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
             float w = max(0.0f, weight.read(gid).r);
-            float s = sum.read(gid).r;
-            // epsilon prevents division-by-zero at background pixels; there all weights
-            // will be equal (1/N) so the blend is stable and evaluates to the mean color (black).
-            float norm = w / (s + 1e-7f);
-            output.write(float4(norm, norm, norm, 1.0f), gid);
+            float m = maxW.read(gid).r;
+            
+            // Giữ lại 1.0 nếu là ảnh rõ nét nhất, ngoại trừ các điểm đen hoàn toàn
+            float outW = 0.0f;
+            if (m > 1e-6f && w >= m - 1e-6f) {
+                outW = 1.0f;
+            }
+            output.write(float4(outW, outW, outW, 1.0f), gid);
         }
         """
 
         let lib = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let accumPipeline = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "accum_sum")!)
-        let divPipeline   = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "div_by_sum")!)
+        let computeMaxPipeline = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "compute_max_weight")!)
+        let comparePipeline    = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "compare_max")!)
 
         let tg      = MTLSize(width: 16, height: 16, depth: 1)
         let tgCount = MTLSize(width: (width+15)/16, height: (height+15)/16, depth: 1)
 
-        // Create accumulator
-        let sumDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
-        sumDesc.usage = [.shaderRead, .shaderWrite]
-        guard let sumTexture = context.device.makeTexture(descriptor: sumDesc) else {
-            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create sum texture"])
+        // Create max weight tracker texture
+        let maxDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
+        maxDesc.usage = [.shaderRead, .shaderWrite]
+        guard let maxTexture = context.device.makeTexture(descriptor: maxDesc) else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create max texture"])
         }
-        try clearTexture(sumTexture)
+        try clearTexture(maxTexture)
 
-        // Pass 1: accumulate
+        // Pass 1: compute max per pixel
         guard let cmd1 = context.commandQueue.makeCommandBuffer() else {
             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
         }
         for weight in weights {
             guard let enc = cmd1.makeComputeCommandEncoder() else { continue }
-            enc.setComputePipelineState(accumPipeline)
+            enc.setComputePipelineState(computeMaxPipeline)
             enc.setTexture(weight, index: 0)
-            enc.setTexture(sumTexture, index: 1)
+            enc.setTexture(maxTexture, index: 1)
             enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tg)
             enc.endEncoding()
         }
         cmd1.commit()
         cmd1.waitUntilCompleted()
 
-        // Pass 2: divide
+        // Pass 2: binarize output based on max
         var result: [MTLTexture] = []
         guard let cmd2 = context.commandQueue.makeCommandBuffer() else {
             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
@@ -445,9 +454,9 @@ public class PyBlend {
                 throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create output texture"])
             }
             guard let enc = cmd2.makeComputeCommandEncoder() else { continue }
-            enc.setComputePipelineState(divPipeline)
+            enc.setComputePipelineState(comparePipeline)
             enc.setTexture(weight, index: 0)
-            enc.setTexture(sumTexture, index: 1)
+            enc.setTexture(maxTexture, index: 1)
             enc.setTexture(outTex, index: 2)
             enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tg)
             enc.endEncoding()
