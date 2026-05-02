@@ -75,3 +75,6 @@ logs/
 # Test data
 test-*/
 test_*
+
+# ShineStacker
+shinestacker/
