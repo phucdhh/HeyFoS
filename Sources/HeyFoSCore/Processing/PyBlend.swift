@@ -40,10 +40,10 @@ public class PyBlend {
         var processedFocusMaps: [MTLTexture] = []
         for (i, focusMap) in focusMaps.enumerated() {
             // Step A: Gaussian pre-blur to suppress high-frequency noise in focus scores.
-            let blurred = try gaussianBlur(focusMap, radius: Float(blurRadius))
+            let blurred = try gaussianBlur(focusMap, radius: 1.5) // Giai đoạn 1: Giảm blurRadius
             // Step B: Guided filter using the corresponding input image as guidance.
             // This edge-preserving smoothing prevents ringing artifacts at focus boundaries.
-            let guided  = try guidedFilter(blurred, guidance: images[i], radius: 8, eps: 0.01)
+            let guided  = try guidedFilter(blurred, guidance: images[i], radius: 4, eps: 0.01) // Giảm radius chặn bleed
             processedFocusMaps.append(guided)
         }
         
@@ -55,12 +55,7 @@ public class PyBlend {
             normalizedFocusMaps.append(normalized)
         }
 
-        // Step 1.5: Binarize weights (Strict Winner-Takes-All)
-        // Giai đoạn 2: Áp đặt cơ chế "Winner-Takes-All" tuyệt đối. 
-        // Chỉ giữ lại mask = 1.0 cho pixel nét nhất, các pixel khác = 0.0.
-        print("  [1.5/4] Binarizing weights across images...")
-        normalizedFocusMaps = try binarizeWeights(normalizedFocusMaps)
-                // Step 1: Build Gaussian pyramids for each image
+        // Step 1: Build Gaussian pyramids for each image
         print("  [1/4] Building Gaussian pyramids...")
         var gaussianPyramids: [[MTLTexture]] = []
         for (i, image) in images.enumerated() {
@@ -79,12 +74,27 @@ public class PyBlend {
             laplacianPyramids.append(laplacian)
         }
         
-        // Step 3: Build weight pyramids from focus maps
-        print("  [3/4] Building weight pyramids...")
-        var weightPyramids: [[MTLTexture]] = []
+        // Step 3: Build continuous focus pyramids and apply Per-Level WTA
+        // Giai đoạn 2: Trọng số nhị phân đa tệp theo tầng tháp (Per-Level WTA Pyramid)
+        print("  [3/4] Building continuous focus pyramids and applying Per-Level WTA...")
+        var continuousFocusPyramids: [[MTLTexture]] = []
         for focusMap in normalizedFocusMaps {
-            let weights = try buildWeightPyramid(focusMap)
-            weightPyramids.append(weights)
+            let focusPyr = try buildWeightPyramid(focusMap)
+            continuousFocusPyramids.append(focusPyr)
+        }
+        
+        var weightPyramids: [[MTLTexture]] = Array(repeating: [], count: images.count)
+        let numLevels = continuousFocusPyramids[0].count
+        for level in 0..<numLevels {
+            var focusMapsAtLevel: [MTLTexture] = []
+            for i in 0..<images.count {
+                focusMapsAtLevel.append(continuousFocusPyramids[i][level])
+            }
+            // Binarize directly at this specific frequency/scale level
+            let binarizedLevel = try binarizeWeights(focusMapsAtLevel)
+            for i in 0..<images.count {
+                weightPyramids[i].append(binarizedLevel[i])
+            }
         }
         
         // Step 4: Blend Laplacian pyramids using weights
