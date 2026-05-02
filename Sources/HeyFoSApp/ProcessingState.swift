@@ -53,7 +53,7 @@ final class ProcessingState: ObservableObject {
     // Settings
     @Published var method: FocusMethod = .ensemble
     @Published var usePyramidBlending: Bool = true
-    @Published var pyramidLevels: Int = 6
+    @Published var pyramidLevels: Int = 8
     @Published var blurRadius: Double = 1.5
     @Published var useAlignment: Bool = false
     @Published var outputPath: String = {

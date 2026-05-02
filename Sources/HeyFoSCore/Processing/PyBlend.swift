@@ -12,8 +12,8 @@ public class PyBlend {
     private let levels: Int      // Number of pyramid levels
     private let blurRadius: Double  // Gaussian blur radius for focus map pre-processing
     
-    // 5 levels: balanced multi-scale blending with reduced artifact accumulation
-    public init(context: MetalContext, levels: Int = 5, blurRadius: Double = 2.5) {
+    // 7 levels: fine frequency decomposition matching Zerene PMax depth of detail
+    public init(context: MetalContext, levels: Int = 7, blurRadius: Double = 2.5) {
         self.context = context
         self.levels = levels
         self.blurRadius = blurRadius
@@ -32,90 +32,40 @@ public class PyBlend {
         let _ = images[0].width
         
         print("Pyramid blending: \(images.count) images, \(levels) levels")
-                // Step 0: Optimize focus maps significantly
-        // This is critical - Laplacian is often too noisy. 
-        // We will perform a heavy Gaussian blur on the focus maps to reduce noise
-        // and create more coherent focus regions.
-        print("  [0/4] Pre-processing focus maps (Gaussian pre-blur + guided filter)...")
-        var processedFocusMaps: [MTLTexture] = []
-        for (i, focusMap) in focusMaps.enumerated() {
-            // Step A: Gaussian pre-blur to suppress high-frequency noise in focus scores.
-            let blurred = try gaussianBlur(focusMap, radius: 1.5) // Giai đoạn 1: Giảm blurRadius
-            // Step B: Guided filter using the corresponding input image as guidance.
-            // This edge-preserving smoothing prevents ringing artifacts at focus boundaries.
-            let guided  = try guidedFilter(blurred, guidance: images[i], radius: 4, eps: 0.01) // Giảm radius chặn bleed
-            processedFocusMaps.append(guided)
-        }
-        
-        // Step 1: Normalize optimized focus maps
-        print("  [1/4] Normalizing... ")
-        var normalizedFocusMaps: [MTLTexture] = []
-        for processed in processedFocusMaps {
-            let normalized = try normalizeFocusMap(processed)
-            normalizedFocusMaps.append(normalized)
-        }
-
+                // Step 0: (focus maps no longer used — base level now uses local variance like ShineStacker)
         // Step 1: Build Gaussian pyramids for each image
-        print("  [1/4] Building Gaussian pyramids...")
+        print("  [1/3] Building Gaussian pyramids...")
         var gaussianPyramids: [[MTLTexture]] = []
-        for (i, image) in images.enumerated() {
+        for image in images {
             let pyramid = try buildGaussianPyramid(image)
             gaussianPyramids.append(pyramid)
-            if i == 0 || i == images.count - 1 {
-                print("    Image \(i): pyramid levels = \(pyramid.count)")
-            }
         }
         
         // Step 2: Build Laplacian pyramids from Gaussian pyramids
-        print("  [2/4] Building Laplacian pyramids...")
+        print("  [2/3] Building Laplacian pyramids...")
         var laplacianPyramids: [[MTLTexture]] = []
         for pyramid in gaussianPyramids {
             let laplacian = try buildLaplacianPyramid(gaussianPyramid: pyramid)
             laplacianPyramids.append(laplacian)
         }
+        gaussianPyramids.removeAll()
         
-        // Step 3: Build continuous focus pyramids and apply Per-Level WTA
-        // Giai đoạn 2: Trọng số nhị phân đa tệp theo tầng tháp (Per-Level WTA Pyramid)
-        print("  [3/4] Building continuous focus pyramids and applying Per-Level WTA...")
-        var continuousFocusPyramids: [[MTLTexture]] = []
-        for focusMap in normalizedFocusMaps {
-            let focusPyr = try buildWeightPyramid(focusMap)
-            continuousFocusPyramids.append(focusPyr)
-        }
-        
-        var weightPyramids: [[MTLTexture]] = Array(repeating: [], count: images.count)
-        let numLevels = continuousFocusPyramids[0].count
-        for level in 0..<numLevels {
-            var focusMapsAtLevel: [MTLTexture] = []
-            for i in 0..<images.count {
-                focusMapsAtLevel.append(continuousFocusPyramids[i][level])
-            }
-            // Binarize directly at this specific frequency/scale level
-            let binarizedLevel = try binarizeWeights(focusMapsAtLevel)
-            for i in 0..<images.count {
-                weightPyramids[i].append(binarizedLevel[i])
-            }
-        }
-        
-        // Step 4: Blend Laplacian pyramids using weights
-        print("  [4/4] Blending pyramids...")
-        let blendedPyramid = try blendPyramids(
+        // Step 3: Blend using ShineStacker's per-level algorithm:
+        // - Detail levels: convolve(gray²) → hard WTA (fuse_laplacian)
+        // - Base level: local variance → hard WTA (get_fused_base / deviation)
+        print("  [3/3] Blending pyramids (ShineStacker per-level energy)...")
+        let blendedPyramid = try blendPyramidsPerLevelEnergy(
             laplacianPyramids: laplacianPyramids,
-            weightPyramids: weightPyramids
+            baseWeightPyramids: []
         )
         
-        // Release intermediate pyramids to free memory
         laplacianPyramids.removeAll()
-        weightPyramids.removeAll()
-        gaussianPyramids.removeAll()
-        normalizedFocusMaps.removeAll()
         
-        // Step 5: Collapse pyramid to final image
+        // Step 4: Collapse pyramid to final image
         print("  Collapsing pyramid to final image...")
         let result = try collapsePyramid(blendedPyramid)
         
         // CRITICAL: Wait for ALL GPU operations to complete before returning
-        // Result texture must be fully rendered before save
         if let commandBuffer = context.commandQueue.makeCommandBuffer() {
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
@@ -180,30 +130,256 @@ public class PyBlend {
 
     /// Removed old maxPoolDownsample in favor of gaussianDownsample
     
-    /// Blend multiple Laplacian pyramids using weight pyramids
-    private func blendPyramids(laplacianPyramids: [[MTLTexture]], weightPyramids: [[MTLTexture]]) throws -> [MTLTexture] {
+    /// ShineStacker-style blending: per-level energy for detail, focus map for base
+    private func blendPyramidsPerLevelEnergy(laplacianPyramids: [[MTLTexture]], baseWeightPyramids: [[MTLTexture]]) throws -> [MTLTexture] {
         let numLevels = laplacianPyramids[0].count
         var blendedPyramid: [MTLTexture] = []
         
-                for level in 0..<numLevels {
-            // Collect all Laplacian levels and weights for this level
+        for level in 0..<numLevels {
+            let isBase = (level == numLevels - 1)
             var laplacianLevels: [MTLTexture] = []
             var weightLevels: [MTLTexture] = []
             
             for i in 0..<laplacianPyramids.count {
                 laplacianLevels.append(laplacianPyramids[i][level])
-                weightLevels.append(weightPyramids[i][level])
+                if isBase {
+                    // Base: ShineStacker get_fused_base — use local variance (deviation) as weight
+                    let variance = try computeLocalVariance(laplacianPyramids[i][level])
+                    weightLevels.append(variance)
+                } else {
+                    // Detail: exact ShineStacker fuse_laplacian — convolve(gray*gray), no sqrt
+                    let energy = try computeSmoothedLaplacianEnergy(laplacianPyramids[i][level])
+                    weightLevels.append(energy)
+                }
             }
             
-            // Blend this level
-            let isBase = (level == numLevels - 1)
-            let blended = try blendLevel(laplacianLevels: laplacianLevels, weightLevels: weightLevels, isBase: isBase)
+            let blended = try blendLevelWTA(laplacianLevels: laplacianLevels, weightLevels: weightLevels)
             blendedPyramid.append(blended)
         }
         
         return blendedPyramid
     }
     
+    /// Exact ShineStacker fuse_laplacian energy: convolve(gray * gray), no sqrt.
+    private func computeSmoothedLaplacianEnergy(_ laplacian: MTLTexture) throws -> MTLTexture {
+        let width = laplacian.width
+        let height = laplacian.height
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        guard let squaredTex = context.device.makeTexture(descriptor: desc) else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create squared texture"])
+        }
+
+        let squareSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void gray_squared(texture2d<float, access::read> lap [[texture(0)]],
+                                  texture2d<float, access::write> out [[texture(1)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+            if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
+            float3 rgb = lap.read(gid).rgb;
+            float gray = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+            out.write(float4(gray * gray, 0, 0, 1), gid);
+        }
+        """
+        let sqLib = try context.device.makeLibrary(source: squareSrc, options: nil)
+        let sqPipeline = try context.device.makeComputePipelineState(function: sqLib.makeFunction(name: "gray_squared")!)
+        guard let sqCmd = context.commandQueue.makeCommandBuffer(),
+              let sqEnc = sqCmd.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
+        }
+        sqEnc.setComputePipelineState(sqPipeline)
+        sqEnc.setTexture(laplacian, index: 0)
+        sqEnc.setTexture(squaredTex, index: 1)
+        let tg = MTLSize(width: 16, height: 16, depth: 1)
+        sqEnc.dispatchThreadgroups(MTLSize(width: (width+15)/16, height: (height+15)/16, depth: 1), threadsPerThreadgroup: tg)
+        sqEnc.endEncoding()
+        sqCmd.commit()
+        sqCmd.waitUntilCompleted()
+
+        // ShineStacker uses the Burt-Adelson convolve — approximate with Gaussian σ≈1.0
+        return try gaussianBlur(squaredTex, radius: 3.0)
+    }
+
+    /// ShineStacker get_fused_base: local variance (deviation) for base-layer WTA.
+    /// deviation(x) = mean(x²) - mean(x)² over a local patch
+    private func computeLocalVariance(_ laplacian: MTLTexture) throws -> MTLTexture {
+        let width = laplacian.width
+        let height = laplacian.height
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        guard let grayTex = context.device.makeTexture(descriptor: desc),
+              let gray2Tex = context.device.makeTexture(descriptor: desc) else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create variance textures"])
+        }
+
+        // Extract grayscale and gray² in one pass
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void extract_gray_gray2(
+            texture2d<float, access::read> inp [[texture(0)]],
+            texture2d<float, access::write> outG [[texture(1)]],
+            texture2d<float, access::write> outG2 [[texture(2)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= outG.get_width() || gid.y >= outG.get_height()) return;
+            float3 rgb = inp.read(gid).rgb;
+            float g = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+            outG.write(float4(g, 0, 0, 1), gid);
+            outG2.write(float4(g * g, 0, 0, 1), gid);
+        }
+        """
+        let lib = try context.device.makeLibrary(source: src, options: nil)
+        let pipe = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "extract_gray_gray2")!)
+        guard let cmd = context.commandQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed cmd"])
+        }
+        let tg = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (width+15)/16, height: (height+15)/16, depth: 1)
+        enc.setComputePipelineState(pipe)
+        enc.setTexture(laplacian, index: 0)
+        enc.setTexture(grayTex, index: 1)
+        enc.setTexture(gray2Tex, index: 2)
+        enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // Blur both to get local mean and local mean-square
+        let meanG  = try gaussianBlur(grayTex,  radius: 3.0)
+        let meanG2 = try gaussianBlur(gray2Tex, radius: 3.0)
+
+        // variance = max(0, meanG2 - meanG²)
+        let varDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
+        varDesc.usage = [.shaderRead, .shaderWrite]
+        guard let varTex = context.device.makeTexture(descriptor: varDesc) else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed var tex"])
+        }
+        let varSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void local_variance(
+            texture2d<float, access::read> meanG  [[texture(0)]],
+            texture2d<float, access::read> meanG2 [[texture(1)]],
+            texture2d<float, access::write> out   [[texture(2)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
+            float mg  = meanG.read(gid).r;
+            float mg2 = meanG2.read(gid).r;
+            float v = max(mg2 - mg * mg, 0.0f);
+            out.write(float4(v, 0, 0, 1), gid);
+        }
+        """
+        let varLib  = try context.device.makeLibrary(source: varSrc, options: nil)
+        let varPipe = try context.device.makeComputePipelineState(function: varLib.makeFunction(name: "local_variance")!)
+        guard let cmd2 = context.commandQueue.makeCommandBuffer(),
+              let enc2 = cmd2.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed cmd2"])
+        }
+        enc2.setComputePipelineState(varPipe)
+        enc2.setTexture(meanG, index: 0)
+        enc2.setTexture(meanG2, index: 1)
+        enc2.setTexture(varTex, index: 2)
+        enc2.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        enc2.endEncoding()
+        cmd2.commit()
+        cmd2.waitUntilCompleted()
+
+        return varTex
+    }
+    
+    /// Pure hard WTA blend — matches ShineStacker's fuse_laplacian/get_fused_base exactly.
+    /// Weight source: per-level energy (details) or focus map (base). No threshold.
+    private func blendLevelWTA(laplacianLevels: [MTLTexture], weightLevels: [MTLTexture]) throws -> MTLTexture {
+        let width = laplacianLevels[0].width
+        let height = laplacianLevels[0].height
+        
+        let accDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+        accDesc.usage = [.shaderRead, .shaderWrite]
+        guard let accValue = context.device.makeTexture(descriptor: accDesc),
+              let accWeight = context.device.makeTexture(descriptor: accDesc) else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create accumulators"])
+        }
+        try clearTexture(accValue)
+        try clearTexture(accWeight)
+        
+        let shaderSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        // Hard WTA: keep the pixel with the highest weight per-pixel.
+        kernel void wta_accumulate(
+            texture2d<float, access::read> laplacian [[texture(0)]],
+            texture2d<float, access::read> weight [[texture(1)]],
+            texture2d<float, access::read_write> accVal [[texture(2)]],
+            texture2d<float, access::read_write> accW [[texture(3)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= accVal.get_width() || gid.y >= accVal.get_height()) return;
+            float w = weight.read(gid).r;
+            float curW = accW.read(gid).r;
+            if (w > curW) {
+                accVal.write(laplacian.read(gid), gid);
+                accW.write(float4(w, 0, 0, 1), gid);
+            }
+        }
+        
+        kernel void wta_finalize(
+            texture2d<float, access::read> accVal [[texture(0)]],
+            texture2d<float, access::write> output [[texture(1)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+            float4 v = accVal.read(gid);
+            v.a = 1.0;
+            output.write(v, gid);
+        }
+        """
+        let lib = try context.device.makeLibrary(source: shaderSrc, options: nil)
+        let accumPipeline = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "wta_accumulate")!)
+        let finPipeline   = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "wta_finalize")!)
+        
+        let tg  = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (width+15)/16, height: (height+15)/16, depth: 1)
+        
+        guard let cmd = context.commandQueue.makeCommandBuffer() else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
+        }
+        
+        // Accumulate: per-frame WTA
+        for i in 0..<laplacianLevels.count {
+            guard let enc = cmd.makeComputeCommandEncoder() else { continue }
+            enc.setComputePipelineState(accumPipeline)
+            enc.setTexture(laplacianLevels[i], index: 0)
+            enc.setTexture(weightLevels[i], index: 1)
+            enc.setTexture(accValue, index: 2)
+            enc.setTexture(accWeight, index: 3)
+            enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+            enc.endEncoding()
+        }
+        
+        // Finalize: output winning pixel
+        let outDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+        outDesc.usage = [.shaderRead, .shaderWrite]
+        guard let output = context.device.makeTexture(descriptor: outDesc),
+              let enc2 = cmd.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create output texture"])
+        }
+        enc2.setComputePipelineState(finPipeline)
+        enc2.setTexture(accValue, index: 0)
+        enc2.setTexture(output, index: 1)
+        enc2.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        enc2.endEncoding()
+        cmd.commit()
+        
+        return output
+    }
+
     /// Blend a single pyramid level using weighted accumulation on GPU
     private func blendLevel(laplacianLevels: [MTLTexture], weightLevels: [MTLTexture], isBase: Bool = false) throws -> MTLTexture {
         let width = laplacianLevels[0].width
@@ -243,31 +419,12 @@ public class PyBlend {
             float4 lapVal = laplacian.read(gid);
             float w = max(0.0f, weight.read(gid).r);
             
-            if (isBase) {
-                // Base layer (Halo Fix): Instead of soft average which pulls background glow,
-                // we use Winner-Takes-All based on the smoothed weight map. This ensures
-                // only the most in-focus region provides the core brightness/color.
-                float curMaxW = accWeight.read(gid).r;
-                if (w > curMaxW) {
-                    accValue.write(lapVal, gid);
-                    accWeight.write(float4(w, 0.0, 0.0, 1.0), gid);
-                }
-            } else {
-                // Detail layers: Pure Winner-Takes-All on Laplacian energy. 
-                // Giai đoạn 3: Lọc tần số không gian (High-pass threshold)
-                // Lọc bỏ nhiễu nền rác. Nếu năng lượng quá bé, đây là vùng background mờ đen cần triệt tiêu.
-                float energy = dot(lapVal.rgb, lapVal.rgb);
-                
-                if (energy < 0.0005f) {
-                    return; // Dưới ngưỡng nhiễu, giữ cho laplacian tích lũy ở mức 0
-                }
-                
-                float curMaxW = accWeight.read(gid).r;
-                if (energy > curMaxW) {
-                    accValue.write(lapVal, gid);
-                    accWeight.write(float4(energy, 0.0, 0.0, 1.0), gid);
-                }
-            }
+            float4 curAccVal = accValue.read(gid);
+            float curAccW = accWeight.read(gid).r;
+            
+            // Standard Burt-Adelson multi-scale blending
+            accValue.write(curAccVal + lapVal * w, gid);
+            accWeight.write(float4(curAccW + w, 0.0, 0.0, 1.0), gid);
         }
         
         kernel void finalize_level(
@@ -285,11 +442,10 @@ public class PyBlend {
             float4 val = accValue.read(gid);
             float  w   = accWeight.read(gid).r;
             
-            if (isBase) {
-                // Base layer is now Winner-Takes-All, so no normalization is needed.
-                // Just write the winning value directly.
-            } 
-            // Detail layers used Winner-Takes-All, so val is already the exact winning pixel!
+            // Soft blend normalize
+            if (w > 1e-6f) {
+                val = val / w;
+            }
             
             val.a = 1.0;
             output.write(val, gid);
@@ -857,45 +1013,48 @@ public class PyBlend {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
         }
         
-        // Simple bilinear upsample using Metal sampler
+        // Burt-Adelson 1983 correct expand: zero-interleave then 4 * convolve.
+        // kernel a=0.4: k = [0.05, 0.25, 0.40, 0.25, 0.05]
+        // CRITICAL: must NOT normalize by kernel sum — the ×4 scale is energy-conserving.
         let shaderSource = """
         #include <metal_stdlib>
         using namespace metal;
 
-        kernel void upsample(
+        kernel void ba_expand(
             texture2d<float, access::read>  input  [[texture(0)]],
             texture2d<float, access::write> output [[texture(1)]],
             uint2 gid [[thread_position_in_grid]])
         {
             if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
-
-            // Map output pixel to fractional input coordinate
-            float in_x = (float(gid.x) + 0.5f) * float(input.get_width())  / float(output.get_width())  - 0.5f;
-            float in_y = (float(gid.y) + 0.5f) * float(input.get_height()) / float(output.get_height()) - 0.5f;
-            int cx = int(round(in_x));
-            int cy = int(round(in_y));
-
-            // Burt-Adelson 5-tap Gaussian kernel — matches the downsample kernel used to build
-            // the pyramid, so the expand/collapse pair is energy-conserving and halo-free.
-            float k[5] = {1.0f/16.0f, 4.0f/16.0f, 6.0f/16.0f, 4.0f/16.0f, 1.0f/16.0f};
-
-            float4 sum    = float4(0.0f);
-            float  totalW = 0.0f;
+            int ox = int(gid.x);
+            int oy = int(gid.y);
+            int sW = int(input.get_width());
+            int sH = int(input.get_height());
+            // Burt-Adelson a=0.4 generating kernel
+            float k[5] = {0.05f, 0.25f, 0.40f, 0.25f, 0.05f};
+            float4 sum = float4(0.0f);
             for (int dy = -2; dy <= 2; dy++) {
                 for (int dx = -2; dx <= 2; dx++) {
-                    int2 sp = clamp(int2(cx + dx, cy + dy),
-                                   int2(0), int2(int(input.get_width())-1, int(input.get_height())-1));
-                    float w = k[dx+2] * k[dy+2];
-                    sum    += input.read(uint2(sp)) * w;
-                    totalW += w;
+                    // Position in expanded (zero-interleaved) grid
+                    int ex = ox - dx;
+                    int ey = oy - dy;
+                    // Only even expanded positions have source values
+                    if (((ex | ey) & 1) == 0) {
+                        int sx = clamp(ex / 2, 0, sW - 1);
+                        int sy = clamp(ey / 2, 0, sH - 1);
+                        sum += input.read(uint2(sx, sy)) * (k[dx+2] * k[dy+2]);
+                    }
                 }
             }
-            output.write(sum / totalW, gid);
+            // ×4 factor from Burt-Adelson expand (energy conservation)
+            sum *= 4.0f;
+            sum.a = max(sum.a, 1.0f);
+            output.write(sum, gid);
         }
         """
         
         let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let function = library.makeFunction(name: "upsample")!
+        let function = library.makeFunction(name: "ba_expand")!
         let pipeline = try context.device.makeComputePipelineState(function: function)
         
         guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
@@ -918,7 +1077,6 @@ public class PyBlend {
         encoder.endEncoding()
         
         commandBuffer.commit()
-        // Async GPU - no wait needed
         
         return outputTexture
     }
@@ -1086,7 +1244,7 @@ public class PyBlend {
         blur.edgeMode = .clamp
 
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba32Float,
+            pixelFormat: texture.pixelFormat,
             width: texture.width,
             height: texture.height,
             mipmapped: false

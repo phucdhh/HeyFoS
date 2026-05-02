@@ -43,7 +43,7 @@ struct SettingsPanel: View {
                         Toggle("Pyramid Blending (PMax mode)", isOn: $state.usePyramidBlending)
                         if state.usePyramidBlending {
                             Stepper("Pyramid levels: \(state.pyramidLevels)",
-                                    value: $state.pyramidLevels, in: 3...8)
+                                    value: $state.pyramidLevels, in: 3...12)
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("Blur radius: \(state.blurRadius, specifier: "%.1f") px")
                                 Slider(value: $state.blurRadius, in: 0.5...6.0, step: 0.5)
