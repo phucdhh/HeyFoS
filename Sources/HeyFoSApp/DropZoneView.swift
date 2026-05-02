@@ -75,21 +75,39 @@ struct SidebarPanel: View {
     private var inputFileList: some View {
         List(selection: $state.selectedInputIndex) {
             ForEach(Array(state.imageFiles.enumerated()), id: \.offset) { idx, url in
-                Text(url.lastPathComponent)
-                    .tag(idx)
-                    .font(.system(size: 12))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .lineLimit(1)
-                    .help(url.path)
-                    .contextMenu {
-                        Button("Remove from List") {
-                            state.imageFiles.remove(at: idx)
-                        }
-                        Divider()
-                        Button("Reveal in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                HStack(spacing: 5) {
+                    // Stacking progress indicator
+                    if let cur = state.currentStackingIndex {
+                        if idx == cur {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.orange)
+                        } else if idx < cur {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.green)
+                        } else {
+                            Image(systemName: "circle")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.secondary.opacity(0.4))
                         }
                     }
+                    Text(url.lastPathComponent)
+                        .font(.system(size: 12))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(1)
+                }
+                .tag(idx)
+                .help(url.path)
+                .contextMenu {
+                    Button("Remove from List") {
+                        state.imageFiles.remove(at: idx)
+                    }
+                    Divider()
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    }
+                }
             }
         }
         .listStyle(.inset)

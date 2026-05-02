@@ -113,6 +113,9 @@ public final class StackProcessor {
     }
     
     /// Full pipeline: load → compute focus → alignment check → color consistency → blending → save
+    /// - Parameter partialPreviewCallback: Called after each image is incrementally stacked.
+    ///   Receives (imageIndex 0-based, totalImages, partialTexture).
+    ///   Use this to save live preview frames (Zerene-style progressive reveal).
     public func processStack(
         inputDirectory: URL,
         outputPath: String,
@@ -122,7 +125,8 @@ public final class StackProcessor {
         pyramidLevels: Int = 6,
         blurRadius: Double = 1.5,
         verbose: Bool = false,
-        progressHandler: ((Double, String) -> Void)? = nil
+        progressHandler: ((Double, String) -> Void)? = nil,
+        partialPreviewCallback: ((Int, Int, MTLTexture) throws -> Void)? = nil
     ) throws {
         logger.info("=== Starting focus stacking pipeline ===")
         logger.info("Input: \(inputDirectory.path)")
@@ -184,8 +188,24 @@ public final class StackProcessor {
         let normalizedImages = try colorNormalizer.normalize(alignedImages)
         logger.info("✓ Color consistency normalization complete")
         
+        // Step 3.8: Incremental DepthMap previews (Zerene-style progressive reveal)
+        // For each image i, quick-blend the first i images and emit a partial preview.
+        // Uses GPU DepthMap WTA which is fast enough for live feedback.
+        if let callback = partialPreviewCallback {
+            logger.info("Generating \(normalizedImages.count) incremental preview frames…")
+            let quickBlender = DepthMap(context: metalContext)
+            for i in 1...normalizedImages.count {
+                let pct = 0.60 + Double(i) / Double(normalizedImages.count) * 0.20
+                progressHandler?(pct, "Stacking image \(i)/\(normalizedImages.count)…")
+                let partialImages    = Array(normalizedImages[0..<i])
+                let partialFocusMaps = Array(focusMaps[0..<i])
+                let partial = try quickBlender.blend(images: partialImages, focusMaps: partialFocusMaps)
+                try callback(i - 1, normalizedImages.count, partial)
+            }
+        }
+
         // Step 4: Perform blending
-        progressHandler?(0.65, "Blending \(images.count) images…")
+        progressHandler?(0.82, "Final blend: \(images.count) images…")
         let result: MTLTexture
         if usePyramidBlending {
             logger.info("Performing PyBlend (Pyramid Blending)...")

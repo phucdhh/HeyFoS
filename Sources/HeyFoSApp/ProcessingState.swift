@@ -1,5 +1,7 @@
 import Foundation
 import AppKit
+import Metal
+import Accelerate
 import HeyFoSCore
 
 // MARK: – Output image record
@@ -46,6 +48,11 @@ final class ProcessingState: ObservableObject {
     @Published var selectedOutputIndex: Int? = nil
     @Published var showAsAdjusted: Bool = false
     @Published var inputThumbnail: NSImage? = nil
+
+    // Zerene-style live stacking preview
+    @Published var currentStackingIndex: Int? = nil   // which input image is being stacked right now
+    @Published var totalStackingImages: Int = 0
+    @Published var livePreviewImage: NSImage? = nil   // intermediate result shown in right panel
 
     // Sheet state
     @Published var showPreferences: Bool = false
@@ -274,6 +281,16 @@ final class ProcessingState: ObservableObject {
                     DispatchQueue.main.async { self?.progress = pct; self?.progressMessage = msg }
                 }
 
+                let partialPreviewCallback: (Int, Int, MTLTexture) throws -> Void = { [weak self] idx, total, texture in
+                    guard let self else { return }
+                    let preview = self.textureToNSImage(texture)
+                    DispatchQueue.main.async {
+                        self.currentStackingIndex = idx
+                        self.totalStackingImages = total
+                        self.livePreviewImage = preview
+                    }
+                }
+
                 // 4. Run pipeline
                 try processor.processStack(
                     inputDirectory: tmp,
@@ -284,7 +301,8 @@ final class ProcessingState: ObservableObject {
                     pyramidLevels: settings.pyramidLevels,
                     blurRadius: settings.blurRadius,
                     verbose: false,
-                    progressHandler: progressHandler
+                    progressHandler: progressHandler,
+                    partialPreviewCallback: partialPreviewCallback
                 )
 
                 // 5. Load result image for preview
@@ -302,6 +320,9 @@ final class ProcessingState: ObservableObject {
                     self.outputURL = outURL
                     self.progress = 1.0
                     self.progressMessage = "Complete! (\(entry.displayName))"
+                    // Clear live preview — final result is now in outputImages
+                    self.livePreviewImage = nil
+                    self.currentStackingIndex = nil
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -309,6 +330,8 @@ final class ProcessingState: ObservableObject {
                     self.errorMessage = error.localizedDescription
                     self.progress = 0
                     self.progressMessage = "Error"
+                    self.livePreviewImage = nil
+                    self.currentStackingIndex = nil
                 }
             }
             if let tmp = tempDir { try? FileManager.default.removeItem(at: tmp) }
@@ -322,5 +345,40 @@ final class ProcessingState: ObservableObject {
         isProcessing = false
         progressMessage = "Cancelled"
         progress = 0
+        livePreviewImage = nil
+        currentStackingIndex = nil
+    }
+
+    // MARK: – Texture → NSImage (off-main-thread safe)
+    /// Converts a .rgba32Float Metal texture to NSImage using Accelerate for fast float→UInt8.
+    private func textureToNSImage(_ texture: MTLTexture) -> NSImage? {
+        let w = texture.width, h = texture.height
+        let count = w * h * 4
+        var floats = [Float](repeating: 0, count: count)
+        texture.getBytes(
+            &floats,
+            bytesPerRow: w * 4 * MemoryLayout<Float>.size,
+            from: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
+                            size: MTLSize(width: w, height: h, depth: 1)),
+            mipmapLevel: 0
+        )
+        // Clamp [0,1] and scale to [0,255] via Accelerate (vectorized)
+        var lo: Float = 0, hi: Float = 1
+        vDSP_vclip(floats, 1, &lo, &hi, &floats, 1, vDSP_Length(count))
+        var scale: Float = 255
+        vDSP_vsmul(floats, 1, &scale, &floats, 1, vDSP_Length(count))
+        var bytes = [UInt8](repeating: 0, count: count)
+        vDSP_vfixu8(floats, 1, &bytes, 1, vDSP_Length(count))
+
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let bi = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue)
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let cg = CGImage(width: w, height: h,
+                               bitsPerComponent: 8, bitsPerPixel: 32,
+                               bytesPerRow: w * 4, space: cs, bitmapInfo: bi,
+                               provider: provider, decode: nil,
+                               shouldInterpolate: true, intent: .defaultIntent)
+        else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: w, height: h))
     }
 }

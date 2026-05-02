@@ -16,6 +16,10 @@ struct DualImageViewer: View {
     }
 
     private var rightTitle: String {
+        if state.isProcessing, let idx = state.currentStackingIndex {
+            let total = state.totalStackingImages
+            return "Live Preview — image \(idx + 1) / \(total)"
+        }
         guard let idx = state.selectedOutputIndex, idx < state.outputImages.count else {
             return state.outputImages.last?.url.path ?? ""
         }
@@ -23,14 +27,23 @@ struct DualImageViewer: View {
     }
 
     private var rightImage: NSImage? {
+        // During processing, show the live incremental result
+        if state.isProcessing, let live = state.livePreviewImage {
+            return live
+        }
         if let idx = state.selectedOutputIndex, idx < state.outputImages.count {
             return state.outputImages[idx].nsImage
         }
         return state.outputImages.last?.nsImage
     }
 
+    // True whenever the right panel should be visible (either final output or live preview)
+    private var showDualPanel: Bool {
+        !state.outputImages.isEmpty || (state.isProcessing && state.livePreviewImage != nil)
+    }
+
     var body: some View {
-        if state.outputImages.isEmpty {
+        if !showDualPanel {
             // Single panel — shows selected input thumbnail or empty hint
             ImageViewerPanel(
                 title: leftTitle,
@@ -49,7 +62,8 @@ struct DualImageViewer: View {
                 ImageViewerPanel(
                     title: rightTitle,
                     image: rightImage,
-                    placeholder: "Select an output image"
+                    placeholder: "Select an output image",
+                    isLivePreview: state.isProcessing && state.livePreviewImage != nil
                 )
             }
         }
@@ -62,6 +76,7 @@ struct ImageViewerPanel: View {
     let title: String
     let image: NSImage?
     let placeholder: String
+    var isLivePreview: Bool = false
 
     @State private var scale: PanelScale = .fitWindow
     @State private var isMaximized = false
@@ -140,7 +155,7 @@ struct ImageViewerPanel: View {
 
     // MARK: Image area
     private var imageArea: some View {
-        ZStack {
+        ZStack(alignment: .topLeading) {
             Color(red: 0.08, green: 0.08, blue: 0.08)
                 .ignoresSafeArea()
 
@@ -177,6 +192,23 @@ struct ImageViewerPanel: View {
                     .foregroundStyle(Color.white.opacity(0.35))
                     .multilineTextAlignment(.center)
                     .padding(24)
+            }
+
+            // LIVE badge — shown while stacking is in progress
+            if isLivePreview {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 7, height: 7)
+                    Text("LIVE")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.black.opacity(0.55))
+                .clipShape(Capsule())
+                .padding(10)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
