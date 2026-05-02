@@ -1240,6 +1240,18 @@ public class PyBlend {
         // Map radius to sigma: for a Gaussian, 3σ ≈ radius, so σ = radius/3.
         // Clamp to minimum 0.5 to avoid degenerate kernel.
         let sigma = max(radius / 3.0, 0.5)
+
+        // MPSImageGaussianBlur requires an RGBA pixel format. Single-channel textures
+        // (e.g. .r32Float used for focus maps) trigger a CGColorSpaceModel assertion:
+        // "source model (1/monochrome) must match destination model (0/RGB)".
+        // Route them through an RGBA wrapper instead.
+        let isSingleChannel = (texture.pixelFormat == .r32Float ||
+                               texture.pixelFormat == .r16Float ||
+                               texture.pixelFormat == .r8Unorm)
+        if isSingleChannel {
+            return try gaussianBlurR32(texture, sigma: sigma)
+        }
+
         let blur = MPSImageGaussianBlur(device: context.device, sigma: sigma)
         blur.edgeMode = .clamp
 
@@ -1263,6 +1275,98 @@ public class PyBlend {
         commandBuffer.commit()
 
         return outputTexture
+    }
+
+    /// Workaround for MPSImageGaussianBlur's RGB-only requirement.
+    /// Expands a single-channel R texture → RGBA, blurs with MPS, then extracts R back.
+    private func gaussianBlurR32(_ texture: MTLTexture, sigma: Float) throws -> MTLTexture {
+        let width  = texture.width
+        let height = texture.height
+
+        let rgbaDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+        rgbaDesc.usage = [.shaderRead, .shaderWrite]
+
+        guard let rgbaIn  = context.device.makeTexture(descriptor: rgbaDesc),
+              let rgbaOut = context.device.makeTexture(descriptor: rgbaDesc) else {
+            throw NSError(domain: "PyramidBlending", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create RGBA blur textures"])
+        }
+
+        let shaderSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void expand_r_rgba(
+            texture2d<float, access::read>  src [[texture(0)]],
+            texture2d<float, access::write> dst [[texture(1)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+            float r = src.read(gid).r;
+            dst.write(float4(r, r, r, 1.0), gid);
+        }
+        kernel void extract_r_rgba(
+            texture2d<float, access::read>  src [[texture(0)]],
+            texture2d<float, access::write> dst [[texture(1)]],
+            uint2 gid [[thread_position_in_grid]])
+        {
+            if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+            dst.write(float4(src.read(gid).r, 0.0, 0.0, 1.0), gid);
+        }
+        """
+        let lib = try context.device.makeLibrary(source: shaderSrc, options: nil)
+        let expandPipe  = try context.device.makeComputePipelineState(
+            function: lib.makeFunction(name: "expand_r_rgba")!)
+        let extractPipe = try context.device.makeComputePipelineState(
+            function: lib.makeFunction(name: "extract_r_rgba")!)
+
+        let tg  = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (width + 15) / 16, height: (height + 15) / 16, depth: 1)
+
+        // Step 1: Expand R channel → RGBA
+        guard let cmd1 = context.commandQueue.makeCommandBuffer(),
+              let enc1 = cmd1.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        enc1.setComputePipelineState(expandPipe)
+        enc1.setTexture(texture, index: 0)
+        enc1.setTexture(rgbaIn,  index: 1)
+        enc1.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        enc1.endEncoding()
+        cmd1.commit()
+        cmd1.waitUntilCompleted()
+
+        // Step 2: MPS Gaussian blur on the RGBA texture
+        let blur = MPSImageGaussianBlur(device: context.device, sigma: sigma)
+        blur.edgeMode = .clamp
+        guard let cmd2 = context.commandQueue.makeCommandBuffer() else {
+            throw NSError(domain: "PyramidBlending", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        blur.encode(commandBuffer: cmd2, sourceTexture: rgbaIn, destinationTexture: rgbaOut)
+        cmd2.commit()
+        cmd2.waitUntilCompleted()
+
+        // Step 3: Extract R channel back to original single-channel format
+        let outDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: texture.pixelFormat, width: width, height: height, mipmapped: false)
+        outDesc.usage = [.shaderRead, .shaderWrite]
+        guard let outTex = context.device.makeTexture(descriptor: outDesc),
+              let cmd3 = context.commandQueue.makeCommandBuffer(),
+              let enc3 = cmd3.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyramidBlending", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        }
+        enc3.setComputePipelineState(extractPipe)
+        enc3.setTexture(rgbaOut, index: 0)
+        enc3.setTexture(outTex,  index: 1)
+        enc3.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        enc3.endEncoding()
+        cmd3.commit()
+        cmd3.waitUntilCompleted()
+
+        return outTex
     }
     
     private func readTexture(_ texture: MTLTexture) throws -> [Float] {

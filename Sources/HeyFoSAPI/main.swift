@@ -203,7 +203,8 @@ func performProcessing(stackId: String, jobId: String, params: ProcessingParams,
                 "message": message,
                 "currentImageIndex": HeyFoSServer.jobStatuses[jobId]?["currentImageIndex"] as? Int ?? 0,
                 "totalImages": HeyFoSServer.jobStatuses[jobId]?["totalImages"] as? Int ?? files.count,
-                "hasPartialPreview": HeyFoSServer.jobStatuses[jobId]?["hasPartialPreview"] as? Bool ?? false
+                "hasPartialPreview": HeyFoSServer.jobStatuses[jobId]?["hasPartialPreview"] as? Bool ?? false,
+                "outputDir": outputDir.path
             ]
         },
         partialPreviewCallback: { imageIndex, totalImages, texture in
