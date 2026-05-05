@@ -428,6 +428,96 @@ public class PyBlend {
         return result
     }
 
+    // MARK: - DMap Streaming Pyramid Blend (soft weighted-average at each scale)
+
+    /// Allocate per-level soft-blend accumulators for DMap-style pyramid blend.
+    /// Call once before the per-image loop. Memory cost: O(levels).
+    internal func makeSoftBlendAccumulators(forImage image: MTLTexture) throws -> ([MTLTexture], [MTLTexture]) {
+        let dimPyramid = try buildGaussianPyramid(image)
+        var accValues:  [MTLTexture] = []
+        var accWeights: [MTLTexture] = []
+        for lvl in 0..<levels {
+            let w = dimPyramid[lvl].width
+            let h = dimPyramid[lvl].height
+            let d = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            guard let av = context.device.makeTexture(descriptor: d),
+                  let aw = context.device.makeTexture(descriptor: d) else {
+                throw NSError(domain: "PyBlend", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "Failed to create level accumulator"])
+            }
+            try clearTexture(av)
+            try clearTexture(aw)
+            accValues.append(av)
+            accWeights.append(aw)
+        }
+        return (accValues, accWeights)
+    }
+
+    /// Accumulate one image + its R32Float weight map into the pyramid accumulators.
+    /// Uses WTA (Winner-Takes-All) at each Laplacian pyramid level: the image with the
+    /// highest softmax weight at each pixel/scale wins — same principle as the sharp preview.
+    internal func softBlendAccumulateImage(_ image: MTLTexture, weightMap: MTLTexture,
+                                           accValues: [MTLTexture], accWeights: [MTLTexture]) throws {
+        // 1. Expand R32Float weight → RGBA32Float (gaussianDownsample needs RGBA)
+        let rgbaWeight    = try expandRToRGBA(weightMap)
+        // 2. Build pyramids
+        let weightPyramid = try buildGaussianPyramid(rgbaWeight)
+        let gaussPyramid  = try buildGaussianPyramid(image)
+        let lapPyramid    = try buildLaplacianPyramid(gaussianPyramid: gaussPyramid)
+        // 3. WTA accumulate at each level: sharpest-focus image wins per pixel per scale
+        for lvl in 0..<levels {
+            try wtaAccumulateStep(value:    lapPyramid[lvl],
+                                  weight:   weightPyramid[lvl],
+                                  accValue: accValues[lvl],
+                                  accWeight: accWeights[lvl])
+        }
+    }
+
+    /// Finalize and collapse the WTA-accumulated pyramid to produce the final blended image.
+    internal func softBlendFinalize(accValues: [MTLTexture], accWeights: [MTLTexture]) throws -> MTLTexture {
+        var blendedPyramid: [MTLTexture] = []
+        for lvl in 0..<levels {
+            blendedPyramid.append(try wtaFinalizeLevel(accValues[lvl]))
+        }
+        let result = try collapsePyramid(blendedPyramid)
+        if let cmd = context.commandQueue.makeCommandBuffer() {
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        }
+        return result
+    }
+
+    // ── Private helpers for DMap pyramid blend ────────────────────────────────────
+
+    /// Expand single-channel R32Float texture → RGBA32Float (r replicated to all channels).
+    private func expandRToRGBA(_ texture: MTLTexture) throws -> MTLTexture {
+        let w = texture.width, h = texture.height
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        guard let out = context.device.makeTexture(descriptor: desc) else {
+            throw NSError(domain: "PyBlend", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create RGBA texture"])
+        }
+        let tg  = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (w+15)/16, height: (h+15)/16, depth: 1)
+        guard let cmd = context.commandQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyBlend", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
+        }
+        enc.setComputePipelineState(expandRRGBAPipeline)
+        enc.setTexture(texture, index: 0)
+        enc.setTexture(out,     index: 1)
+        enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return out
+    }
+
     /// Streaming WTA accumulate step: update (accValue, accWeight) for one image.
     /// Called once per image per pyramid level.  Uses the same wta_accumulate kernel
     /// as the batch path — pixel-level output is identical.

@@ -44,30 +44,87 @@ final class ColorConsistencyNormalizer {
 
     /// Returns a new array of textures with matched luminance.
     /// The middle frame is used as the reference and is returned unchanged.
+    ///
+    /// Uses 2 GPU round-trips for the whole stack instead of N:
+    ///   Phase 1 — submit all N downscale ops, wait once, read back in parallel on CPU
+    ///   Phase 2 — submit all scale ops (async, downstream GPU work sequences after them)
     func normalize(_ images: [MTLTexture]) throws -> [MTLTexture] {
         guard images.count > 1 else { return images }
 
         let referenceIdx = images.count / 2
-        let refMean = try computeMeanLuminance(images[referenceIdx])
+        let smallSize    = 64
+        let pixelCount   = smallSize * smallSize
+
+        // ── Phase 1: submit all N downscale ops to GPU without waiting ──────────
+        var smallTextures: [MTLTexture] = []
+        smallTextures.reserveCapacity(images.count)
+        let scaleFilter = MPSImageBilinearScale(device: context.device)
+        var lastDownscaleCmd: MTLCommandBuffer?
+
+        for img in images {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba32Float, width: smallSize, height: smallSize, mipmapped: false)
+            desc.usage       = [.shaderRead, .shaderWrite]
+            desc.storageMode = .shared
+            guard let smallTex = context.device.makeTexture(descriptor: desc),
+                  let cmdBuf   = context.commandQueue.makeCommandBuffer() else {
+                return images   // allocation failure — skip normalization
+            }
+            var transform = MPSScaleTransform(
+                scaleX: Double(smallSize) / Double(img.width),
+                scaleY: Double(smallSize) / Double(img.height),
+                translateX: 0, translateY: 0)
+            withUnsafePointer(to: &transform) { scaleFilter.scaleTransform = $0 }
+            scaleFilter.encode(commandBuffer: cmdBuf, sourceTexture: img, destinationTexture: smallTex)
+            cmdBuf.commit()
+            smallTextures.append(smallTex)
+            lastDownscaleCmd = cmdBuf
+        }
+
+        // Single wait — Metal queue ordering guarantees all prior command buffers are done
+        lastDownscaleCmd?.waitUntilCompleted()
+
+        // ── Phase 2: parallel CPU readback + luminance computation ───────────────
+        var luminances = [Double](repeating: 0, count: images.count)
+        DispatchQueue.concurrentPerform(iterations: images.count) { i in
+            var pixels = [Float](repeating: 0, count: pixelCount * 4)
+            pixels.withUnsafeMutableBytes { ptr in
+                smallTextures[i].getBytes(
+                    ptr.baseAddress!,
+                    bytesPerRow: smallSize * MemoryLayout<Float>.size * 4,
+                    from: MTLRegionMake2D(0, 0, smallSize, smallSize),
+                    mipmapLevel: 0)
+            }
+            var lumaArr = [Float](repeating: 0, count: pixelCount)
+            for j in 0..<pixelCount {
+                lumaArr[j] = 0.2126 * pixels[j * 4] + 0.7152 * pixels[j * 4 + 1] + 0.0722 * pixels[j * 4 + 2]
+            }
+            var mean: Float = 0
+            vDSP_meanv(lumaArr, 1, &mean, vDSP_Length(pixelCount))
+            luminances[i] = Double(mean)    // each i is unique — no data race
+        }
+
+        let refMean = luminances[referenceIdx]
         logger.info("Color consistency: reference frame \(referenceIdx) mean luminance = \(String(format: "%.4f", refMean))")
 
-        return try images.enumerated().map { (i, img) in
-            if i == referenceIdx { return img }
-
-            let frameMean = try computeMeanLuminance(img)
-            guard frameMean > 1e-6 else { return img }
+        // ── Phase 3: submit all scale operations as a single GPU batch ───────────
+        // Result textures are consumed by downstream GPU work on the same command queue;
+        // Metal queue ordering guarantees they are written before they are read.
+        var results = [MTLTexture](repeating: images[0], count: images.count)
+        for (i, img) in images.enumerated() {
+            if i == referenceIdx { results[i] = img; continue }
+            let frameMean = luminances[i]
+            guard frameMean > 1e-6 else { results[i] = img; continue }
 
             let rawScale = refMean / frameMean
-            // Clamp to avoid extreme corrections for legitimate exposure differences
-            let scale = Float(min(max(rawScale, 0.70), 1.40))
-
-            if abs(scale - 1.0) < 0.02 {
-                return img  // No meaningful correction needed
-            }
+            let scale    = Float(min(max(rawScale, 0.70), 1.40))
+            if abs(scale - 1.0) < 0.02 { results[i] = img; continue }
 
             logger.debug("  Frame \(i): mean=\(String(format: "%.4f", frameMean)) scale=\(String(format: "%.3f", scale))")
-            return try applyLuminanceScale(img, scale: scale)
+            results[i] = try applyLuminanceScale(img, scale: scale)
         }
+
+        return results
     }
 
     // MARK: - Private

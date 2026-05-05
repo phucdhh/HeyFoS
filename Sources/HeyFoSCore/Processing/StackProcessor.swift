@@ -84,32 +84,35 @@ public final class StackProcessor {
         return result
     }
     
-    /// Compute focus measures for all images in stack
+    /// Compute focus measures for all images in stack.
+    /// Encodes grayscale + focus command buffers concurrently across CPU cores.
+    /// FocusMeasureProcessor holds only read-only pipeline states → thread-safe to share.
+    /// Within each image, grayscale is committed before focus on the same thread,
+    /// so Metal queue ordering guarantees correct per-image GPU execution order.
     public func computeFocusMeasures(
         for textures: [MTLTexture],
         method: FocusMeasureProcessor.Method = .ensemble
     ) throws -> [MTLTexture] {
         logger.info("Computing focus measures for \(textures.count) images...")
-        
-        var focusMaps: [MTLTexture] = []
-        
-        for (index, texture) in textures.enumerated() {
-            logger.info("[\(index + 1)/\(textures.count)] Computing focus measure...")
-            
-            // Convert to grayscale first
-            let grayTexture = try focusProcessor.convertToGrayscale(inputTexture: texture)
-            
-            // Compute focus measure
-            let focusMap = try focusProcessor.computeFocusMeasure(
-                inputTexture: grayTexture,
-                method: method
-            )
-            
-            focusMaps.append(focusMap)
+
+        var focusMaps  = [MTLTexture?](repeating: nil, count: textures.count)
+        var firstError: Error?
+        let lock = NSLock()
+
+        DispatchQueue.concurrentPerform(iterations: textures.count) { index in
+            do {
+                let gray     = try self.focusProcessor.convertToGrayscale(inputTexture: textures[index])
+                let focusMap = try self.focusProcessor.computeFocusMeasure(inputTexture: gray, method: method)
+                lock.lock(); focusMaps[index] = focusMap; lock.unlock()
+            } catch {
+                lock.lock(); if firstError == nil { firstError = error }; lock.unlock()
+            }
         }
-        
-        logger.info("✓ Focus measures computed for all images")
-        return focusMaps
+
+        if let err = firstError { throw err }
+        let result = focusMaps.compactMap { $0 }
+        logger.info("✓ Focus measures computed for all images (\(result.count)/\(textures.count))")
+        return result
     }
     
     /// Full pipeline: load → compute focus → alignment check → color consistency → blending → save
@@ -225,7 +228,17 @@ public final class StackProcessor {
         } else {
             logger.info("Performing DepthMap blending...")
             let blender = DepthMap(context: metalContext)
-            result = try blender.blend(images: normalizedImages, focusMaps: focusMaps, verbose: verbose)
+            result = try blender.blend(
+                images: normalizedImages,
+                focusMaps: focusMaps,
+                progressHandler: { pct, msg in
+                    // Scale DMap's 0→1 range into the 60%→95% pipeline window
+                    progressHandler?(0.60 + pct * 0.35, msg)
+                },
+                partialPreviewCallback: { i, total, tex in
+                    try partialPreviewCallback?(i, total, tex)
+                }
+            )
             logger.info("✓ DepthMap blending complete")
         }
         
