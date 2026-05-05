@@ -108,6 +108,7 @@ final class ProcessingState: ObservableObject {
             }
         }
         // Merge uniquely, preserve sort order
+        let hadImages = !imageFiles.isEmpty
         var seen = Set(imageFiles.map(\.path))
         for url in collected where !seen.contains(url.path) {
             imageFiles.append(url)
@@ -115,6 +116,11 @@ final class ProcessingState: ObservableObject {
         }
         imageFiles.sort { $0.lastPathComponent < $1.lastPathComponent }
         errorMessage = nil
+        // Auto-select first image when the list was previously empty
+        if !hadImages, !imageFiles.isEmpty {
+            selectedInputIndex = 0
+            loadThumbnail(at: 0)
+        }
     }
 
     func removeImages(at offsets: IndexSet) {
