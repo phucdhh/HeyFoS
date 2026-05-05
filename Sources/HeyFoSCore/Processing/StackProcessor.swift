@@ -188,44 +188,39 @@ public final class StackProcessor {
         let normalizedImages = try colorNormalizer.normalize(alignedImages)
         logger.info("✓ Color consistency normalization complete")
         
-        // Step 3.8: Incremental DepthMap previews (Zerene-style progressive reveal)
-        // Uses O(1)-per-step streaming WTA so total cost is O(N) not O(N²).
-        // Each call only processes the one new image against the running best-so-far state.
-        if let callback = partialPreviewCallback {
-            logger.info("Generating \(normalizedImages.count) incremental preview frames…")
-            let quickBlender = DepthMap(context: metalContext)
-            var previewTex: MTLTexture? = nil
-            var scoreTex: MTLTexture? = nil
-            for i in 0..<normalizedImages.count {
-                let pct = 0.60 + Double(i + 1) / Double(normalizedImages.count) * 0.20
-                progressHandler?(pct, "Stacking image \(i + 1)/\(normalizedImages.count)…")
-                (previewTex, scoreTex) = try quickBlender.blendPreviewStep(
-                    newImage: normalizedImages[i],
-                    newFocusMap: focusMaps[i],
-                    bestImage: previewTex,
-                    bestScore: scoreTex
-                )
-                try callback(i, normalizedImages.count, previewTex!)
-            }
-        }
-
-        // Step 4: Perform blending
-        progressHandler?(0.82, "Final blend: 0/\(normalizedImages.count)…")
+        // Steps 3.8 + 4 unified: PyBlend streaming with per-image WTA preview.
+        // Both passes are merged into one loop — each image is processed once through
+        // the Laplacian pyramid accumulator (final-blend quality) while the fast WTA
+        // blendPreviewStep updates the UI after every image for a smooth progressive reveal.
+        // The final PyBlend result replaces the WTA preview exactly once at the end.
+        // Algorithm and output are identical to the previous two-pass approach.
+        progressHandler?(0.60, "Blending 0/\(normalizedImages.count)…")
         let result: MTLTexture
         if usePyramidBlending {
             logger.info("Performing PyBlend (Pyramid Blending)...")
-            let blender = PyBlend(context: metalContext, levels: pyramidLevels, blurRadius: blurRadius)
+            let blender     = PyBlend(context: metalContext, levels: pyramidLevels, blurRadius: blurRadius)
+            let quickBlender = DepthMap(context: metalContext)
+            var previewTex: MTLTexture? = nil
+            var scoreTex:   MTLTexture? = nil
             result = try blender.blend(
                 images: normalizedImages,
                 focusMaps: focusMaps,
-                progressCallback: { current, total, preview in
-                    // Advance progress bar 0.82 → 0.95 across the blend loop
-                    let pct = 0.82 + Double(current + 1) / Double(total) * 0.13
-                    progressHandler?(pct, "Final blend: \(current + 1)/\(total)…")
-                    // Reuse partialPreviewCallback so the UI updates with improving-quality previews
-                    try partialPreviewCallback?(current, total, preview)
+                perImageCallback: { i, total in
+                    let pct = 0.60 + Double(i + 1) / Double(total) * 0.35
+                    progressHandler?(pct, "Blending \(i + 1)/\(total)…")
+                    if let callback = partialPreviewCallback {
+                        (previewTex, scoreTex) = try quickBlender.blendPreviewStep(
+                            newImage:    normalizedImages[i],
+                            newFocusMap: focusMaps[i],
+                            bestImage:   previewTex,
+                            bestScore:   scoreTex
+                        )
+                        try callback(i, total, previewTex!)
+                    }
                 }
             )
+            // Show the final high-quality PyBlend result once — replaces the last WTA preview
+            try partialPreviewCallback?(normalizedImages.count - 1, normalizedImages.count, result)
             logger.info("✓ PyBlend complete")
         } else {
             logger.info("Performing DepthMap blending...")

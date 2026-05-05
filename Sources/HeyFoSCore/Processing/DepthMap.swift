@@ -221,22 +221,66 @@ public class DepthMap {
             initCmd.waitUntilCompleted()
         }
 
+        // Smooth the focus score spatially before WTA comparison.
+        // Blurring prevents per-pixel noise in the focus map from causing "grain" in the
+        // preview — the WTA now selects contiguous regions instead of scattered pixels.
+        // This only affects the preview; PyBlend final quality is completely unchanged.
+        let smoothedScore = try blurFocusScore(focusMap: newFocusMap, sigma: 8.0,
+                                               width: width, height: height, tg: tg, tgc: tgc)
+
         // Update bestImage/bestScore with this new image (O(1) GPU work)
         guard let cmd = context.commandQueue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder() else {
             throw NSError(domain: "DepthMap", code: -1, userInfo: [NSLocalizedDescriptionKey: "preview cmd failed"])
         }
         enc.setComputePipelineState(previewStepPipe)
-        enc.setTexture(newImage,   index: 0)
-        enc.setTexture(newFocusMap, index: 1)
-        enc.setTexture(outImage,   index: 2)
-        enc.setTexture(outScore,   index: 3)
+        enc.setTexture(newImage,      index: 0)
+        enc.setTexture(smoothedScore, index: 1)  // blurred score → smooth region selection
+        enc.setTexture(outImage,      index: 2)
+        enc.setTexture(outScore,      index: 3)
         enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
         enc.endEncoding()
         cmd.commit()
         cmd.waitUntilCompleted()
 
         return (outImage, outScore)
+    }
+
+    /// Gaussian-blur the R-channel focus score from an RGBA or R32Float focus map.
+    /// Returns an R32Float texture with the spatially smoothed score.
+    private func blurFocusScore(focusMap: MTLTexture, sigma: Float,
+                                width: Int, height: Int,
+                                tg: MTLSize, tgc: MTLSize) throws -> MTLTexture {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        guard let tmpH    = context.device.makeTexture(descriptor: desc),
+              let blurred = context.device.makeTexture(descriptor: desc) else {
+            throw NSError(domain: "DepthMap", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Blur texture alloc failed"])
+        }
+        var sigmaVal = sigma
+        guard let cmd = context.commandQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw NSError(domain: "DepthMap", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Blur cmd failed"])
+        }
+        // Horizontal pass: RGBA/R32Float focusMap → R32Float tmpH
+        enc.setComputePipelineState(blurHPipe)
+        enc.setTexture(focusMap, index: 0)
+        enc.setTexture(tmpH,     index: 1)
+        enc.setBytes(&sigmaVal, length: 4, index: 0)
+        enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        // Vertical pass: R32Float tmpH → R32Float blurred
+        enc.setComputePipelineState(blurVPipe)
+        enc.setTexture(tmpH,     index: 0)
+        enc.setTexture(blurred,  index: 1)
+        enc.setBytes(&sigmaVal, length: 4, index: 0)
+        enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return blurred
     }
 
     private func createTexture(width: Int, height: Int, format: MTLPixelFormat) throws -> MTLTexture {

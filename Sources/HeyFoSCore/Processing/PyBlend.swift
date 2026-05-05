@@ -347,13 +347,13 @@ public class PyBlend {
     ///   - images: Input images (already aligned)
     ///   - focusMaps: Focus quality maps for each image
     /// - Returns: Blended output texture
-    /// - Parameter progressCallback: Called at milestone images during blending (≈8 times total).
-    ///   Receives (imageIndex 0-based, total, partialResult) — partialResult is a full pyramid
-    ///   collapse of images accumulated so far, showing quality improving in real time.
+    /// - Parameter perImageCallback: Called after every image is accumulated (index 0-based, total).
+    ///   No texture is returned — callers drive their own side-channel preview (e.g. WTA)
+    ///   without coupling to pyramid internals. Final result is unchanged.
     public func blend(
         images: [MTLTexture],
         focusMaps: [MTLTexture],
-        progressCallback: ((Int, Int, MTLTexture) throws -> Void)? = nil
+        perImageCallback: ((Int, Int) throws -> Void)? = nil
     ) throws -> MTLTexture {
         guard images.count == focusMaps.count, !images.isEmpty else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid input"])
@@ -406,29 +406,8 @@ public class PyBlend {
                                      accWeight: accWeights[lvl])
             }
             // gaussPyramid and lapPyramid go out of scope here → ARC releases GPU textures.
-
-            // Progressive preview at milestones: snapshot current accumulators → collapse → callback.
-            // Produces ~8 full-quality previews regardless of N, each showing more images blended.
-            // Cost per snapshot = one collapsePyramid call (fixed, independent of N).
-            if let cb = progressCallback {
-                let interval = max(5, images.count / 8)
-                if (i + 1) % interval == 0 || i == images.count - 1 {
-                    var snapPyramid: [MTLTexture] = []
-                    for lvl in 0..<levels {
-                        snapPyramid.append(try wtaFinalizeLevel(accValues[lvl]))
-                    }
-                    let snapResult = try collapsePyramid(snapPyramid)
-                    // collapsePyramid ends with async GPU ops (unsharpMask, setAlphaToOne).
-                    // Without this fence, the snapshot texture has alpha=0 → renders black.
-                    // An empty command buffer in the same queue completes only after all
-                    // previously-enqueued work has finished (Metal queues are ordered).
-                    if let fence = context.commandQueue.makeCommandBuffer() {
-                        fence.commit()
-                        fence.waitUntilCompleted()
-                    }
-                    try cb(i, images.count, snapResult)
-                }
-            }
+            // Notify caller so it can update its own preview side-channel (e.g. WTA).
+            try perImageCallback?(i, images.count)
         }
 
         // Step 3: Finalize each level accumulator → blended pyramid → collapse.
