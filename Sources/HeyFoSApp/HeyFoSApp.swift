@@ -1,6 +1,17 @@
 import SwiftUI
 import AppKit
 
+// MARK: - FocusedValues key so state is available in menus even without a focused view
+private struct ProcessingStateKey: FocusedValueKey {
+    typealias Value = ProcessingState
+}
+extension FocusedValues {
+    var processingState: ProcessingState? {
+        get { self[ProcessingStateKey.self] }
+        set { self[ProcessingStateKey.self] = newValue }
+    }
+}
+
 @main
 struct HeyFoSDesktopApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -22,7 +33,7 @@ struct HeyFoSDesktopApp: App {
 
 // MARK: - File menu additions
 struct FileMenuCommands: Commands {
-    @FocusedObject var state: ProcessingState?
+    @FocusedValue(\.processingState) var state: ProcessingState?
 
     var body: some Commands {
         CommandGroup(after: .newItem) {
@@ -58,7 +69,7 @@ struct FileMenuCommands: Commands {
 
 // MARK: - Stack menu (mirrors ZereneStacker's Stack menu)
 struct StackMenuCommands: Commands {
-    @FocusedObject var state: ProcessingState?
+    @FocusedValue(\.processingState) var state: ProcessingState?
 
     var body: some Commands {
         CommandMenu("Stack") {
@@ -90,7 +101,7 @@ struct StackMenuCommands: Commands {
 
 // MARK: - Options menu (mirrors ZereneStacker's Options menu)
 struct OptionsMenuCommands: Commands {
-    @FocusedObject var state: ProcessingState?
+    @FocusedValue(\.processingState) var state: ProcessingState?
 
     var body: some Commands {
         CommandMenu("Options") {

@@ -54,6 +54,9 @@ final class ProcessingState: ObservableObject {
     @Published var totalStackingImages: Int = 0
     @Published var livePreviewImage: NSImage? = nil   // intermediate result shown in right panel
 
+    // Cancellation flag — written on main thread, read on background thread (benign bool race)
+    private var _isCancelled: Bool = false
+
     // Sheet state
     @Published var showPreferences: Bool = false
 
@@ -232,6 +235,7 @@ final class ProcessingState: ObservableObject {
         guard !imageFiles.isEmpty, !isProcessing else { return }
         errorMessage = nil
         isProcessing = true
+        _isCancelled = false
         progress = 0
         progressMessage = "Preparing…"
 
@@ -284,11 +288,12 @@ final class ProcessingState: ObservableObject {
                 let processor = StackProcessor(metalContext: metalContext)
 
                 let progressHandler: (Double, String) -> Void = { [weak self] pct, msg in
-                    DispatchQueue.main.async { self?.progress = pct; self?.progressMessage = msg }
+                    guard let self, !self._isCancelled else { return }
+                    DispatchQueue.main.async { self.progress = pct; self.progressMessage = msg }
                 }
 
                 let partialPreviewCallback: (Int, Int, MTLTexture) throws -> Void = { [weak self] idx, total, texture in
-                    guard let self else { return }
+                    guard let self, !self._isCancelled else { throw CancellationError() }
                     let preview = self.textureToNSImage(texture)
                     DispatchQueue.main.async {
                         self.currentStackingIndex = idx
@@ -315,6 +320,7 @@ final class ProcessingState: ObservableObject {
                 )
 
                 // 5. Load result image for preview
+                guard !self._isCancelled else { return }
                 let image = NSImage(contentsOf: outURL)
                 DispatchQueue.main.async {
                     let entry = OutputImageEntry(
@@ -335,6 +341,8 @@ final class ProcessingState: ObservableObject {
                 }
             } catch {
                 DispatchQueue.main.async {
+                    // If the user cancelled, the UI was already reset — don't overwrite with error
+                    guard !self._isCancelled else { return }
                     self.isProcessing = false
                     self.errorMessage = error.localizedDescription
                     self.progress = 0
@@ -348,9 +356,7 @@ final class ProcessingState: ObservableObject {
     }
 
     func cancelProcessing() {
-        // Note: StackProcessor doesn't support cancellation mid-flight yet.
-        // We just reset the UI state; the background work finishes and its
-        // result is ignored once isProcessing = false here.
+        _isCancelled = true
         isProcessing = false
         progressMessage = "Cancelled"
         progress = 0

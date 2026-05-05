@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var state = ProcessingState()
+    @State private var showCancelConfirm = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,22 +25,32 @@ struct ContentView: View {
             SettingsPanel(state: state)
                 .frame(minWidth: 380, minHeight: 420)
         }
+        .confirmationDialog(
+            "Cancel focus stacking?",
+            isPresented: $showCancelConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Stop Processing", role: .destructive) { state.cancelProcessing() }
+            Button("Keep Going", role: .cancel) {}
+        } message: {
+            Text("The current stack will be discarded.")
+        }
         .safeAreaInset(edge: .bottom) {
             statusBar
         }
-        .focusedObject(state)
+        .focusedSceneValue(\.processingState, state)
     }
 
     // MARK: Processing bar — top of window, text-inside-bar design
     private var processingBar: some View {
         HStack(spacing: 8) {
             // Cancel button on the left
-            Button(action: { state.cancelProcessing() }) {
+            Button(action: { showCancelConfirm = true }) {
                 Image(systemName: "xmark")
                     .font(.system(size: 10, weight: .bold))
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.white.opacity(0.85))
+            .foregroundStyle(.red)
             .padding(.leading, 10)
 
             // Bar with embedded label
