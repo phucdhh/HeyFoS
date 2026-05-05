@@ -40,7 +40,11 @@ public final class StackProcessor {
     /// Images are decoded in parallel (one thread per logical CPU / 2, capped at 4)
     /// to exploit the M-series efficiency cores for I/O-bound work.
     /// Default 3840 provides 10MP output — optimal for most users.
-    public func loadImagesFromDirectory(_ url: URL, maxDimension: Int = 3840) throws -> [MTLTexture] {
+    public func loadImagesFromDirectory(
+        _ url: URL,
+        maxDimension: Int = 3840,
+        perImageProgress: ((Int, Int) -> Void)? = nil
+    ) throws -> [MTLTexture] {
         let imageURLs = try getAllImageURLs(url)
         guard !imageURLs.isEmpty else { throw StackProcessingError.noImagesFound }
         logger.info("Found \(imageURLs.count) images in directory")
@@ -48,6 +52,7 @@ public final class StackProcessor {
         // Pre-allocate result slots so index ordering is preserved
         var textures   = [MTLTexture?](repeating: nil, count: imageURLs.count)
         var firstError: Error?
+        var doneCount  = 0
         let lock       = NSLock()
 
         // Each ImageLoader uses its own LibRaw processor handle (thread-safe)
@@ -69,7 +74,10 @@ public final class StackProcessor {
                 }
                 lock.lock()
                 textures[index] = texture
+                doneCount += 1
+                let snapshot = doneCount
                 lock.unlock()
+                perImageProgress?(snapshot, imageURLs.count)
             } catch {
                 lock.lock()
                 if firstError == nil { firstError = error }
@@ -91,19 +99,26 @@ public final class StackProcessor {
     /// so Metal queue ordering guarantees correct per-image GPU execution order.
     public func computeFocusMeasures(
         for textures: [MTLTexture],
-        method: FocusMeasureProcessor.Method = .ensemble
+        method: FocusMeasureProcessor.Method = .ensemble,
+        perImageProgress: ((Int, Int) -> Void)? = nil
     ) throws -> [MTLTexture] {
         logger.info("Computing focus measures for \(textures.count) images...")
 
         var focusMaps  = [MTLTexture?](repeating: nil, count: textures.count)
         var firstError: Error?
+        var doneCount  = 0
         let lock = NSLock()
 
         DispatchQueue.concurrentPerform(iterations: textures.count) { index in
             do {
                 let gray     = try self.focusProcessor.convertToGrayscale(inputTexture: textures[index])
                 let focusMap = try self.focusProcessor.computeFocusMeasure(inputTexture: gray, method: method)
-                lock.lock(); focusMaps[index] = focusMap; lock.unlock()
+                lock.lock()
+                focusMaps[index] = focusMap
+                doneCount += 1
+                let snapshot = doneCount
+                lock.unlock()
+                perImageProgress?(snapshot, textures.count)
             } catch {
                 lock.lock(); if firstError == nil { firstError = error }; lock.unlock()
             }
@@ -145,8 +160,11 @@ public final class StackProcessor {
              ImageLoaderDebug.inspectImageSource(url: try self.getAllImageURLs(inputDirectory)[0])
         }
         
-        progressHandler?(0.05, "Loading images…")
-        let images = try loadImagesFromDirectory(inputDirectory)
+        progressHandler?(0.05, "Loading images… 0/?")
+        let images = try loadImagesFromDirectory(inputDirectory, perImageProgress: { done, total in
+            let pct = 0.05 + 0.14 * Double(done) / Double(total)
+            progressHandler?(pct, "Loading images… \(done)/\(total)")
+        })
         
         // Debug first image loaded texture
         if verbose {
@@ -155,8 +173,11 @@ public final class StackProcessor {
         }
         
         // Step 2: Compute focus measures
-        progressHandler?(0.20, "Computing focus measures…")
-        let focusMaps = try computeFocusMeasures(for: images, method: method)
+        progressHandler?(0.20, "Computing focus maps… 0/\(images.count)")
+        let focusMaps = try computeFocusMeasures(for: images, method: method, perImageProgress: { done, total in
+            let pct = 0.20 + 0.15 * Double(done) / Double(total)
+            progressHandler?(pct, "Computing focus maps… \(done)/\(total)")
+        })
         
         // Step 3: Alignment check + correction
         var alignedImages = images

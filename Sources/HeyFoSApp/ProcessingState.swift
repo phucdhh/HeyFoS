@@ -288,6 +288,9 @@ final class ProcessingState: ObservableObject {
                         self.currentStackingIndex = idx
                         self.totalStackingImages = total
                         self.livePreviewImage = preview
+                        // Auto-select the image currently being stacked so the
+                        // list highlights it and the left viewer shows its thumbnail.
+                        self.selectedInputIndex = idx
                     }
                 }
 

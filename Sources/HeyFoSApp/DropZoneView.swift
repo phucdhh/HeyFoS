@@ -8,10 +8,11 @@ struct SidebarPanel: View {
     @State private var isDragging = false
 
     var body: some View {
-        VStack(spacing: 0) {
+        VSplitView {
             inputFilesSection
-            Divider()
+                .frame(minHeight: 120)
             outputImagesSection
+                .frame(minHeight: 50, idealHeight: 110, maxHeight: 180)
         }
         .onDrop(of: [.fileURL], isTargeted: $isDragging) { handleDrop($0) }
         .overlay(
