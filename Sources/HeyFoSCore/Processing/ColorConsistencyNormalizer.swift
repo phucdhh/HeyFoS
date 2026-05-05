@@ -16,9 +16,30 @@ import Logging
 final class ColorConsistencyNormalizer {
     private let context: MetalContext
     private let logger = Logger(label: "com.heyfos.color-consistency")
+    private let scalePipeline: MTLComputePipelineState
+
+    private static let scaleShaderSrc = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void scale_exposure(
+        texture2d<float, access::read>  input  [[texture(0)]],
+        texture2d<float, access::write> output [[texture(1)]],
+        constant float &scale [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        float4 px = input.read(gid);
+        px = float4(clamp(px.rgb * scale, 0.0, 1.0), px.a);
+        output.write(px, gid);
+    }
+    """
 
     init(context: MetalContext) {
         self.context = context
+        let lib = try! context.device.makeLibrary(
+            source: ColorConsistencyNormalizer.scaleShaderSrc, options: nil)
+        scalePipeline = try! context.device.makeComputePipelineState(
+            function: lib.makeFunction(name: "scale_exposure")!)
     }
 
     /// Returns a new array of textures with matched luminance.
@@ -119,33 +140,12 @@ final class ColorConsistencyNormalizer {
             return texture
         }
 
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void scale_exposure(
-            texture2d<float, access::read>  input  [[texture(0)]],
-            texture2d<float, access::write> output [[texture(1)]],
-            constant float &scale [[buffer(0)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
-            float4 px = input.read(gid);
-            // Scale RGB, preserve alpha, clamp to valid range
-            px = float4(clamp(px.rgb * scale, 0.0, 1.0), px.a);
-            output.write(px, gid);
-        }
-        """
-
-        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let fn = library.makeFunction(name: "scale_exposure")!
-        let pipeline = try context.device.makeComputePipelineState(function: fn)
-
         guard let cmdBuf = context.commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else {
             return texture
         }
 
-        enc.setComputePipelineState(pipeline)
+        enc.setComputePipelineState(scalePipeline)
         enc.setTexture(texture, index: 0)
         enc.setTexture(outTex, index: 1)
         var s = scale

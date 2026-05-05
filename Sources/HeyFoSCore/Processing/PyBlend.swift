@@ -7,16 +7,339 @@ import MetalPerformanceShaders
 /// Uses multi-scale Laplacian pyramid to reduce halos and improve edge quality
 /// Renamed to PyBlend for consistency with project terminology
 public class PyBlend {
-    
+
     private let context: MetalContext
-    private let levels: Int      // Number of pyramid levels
-    private let blurRadius: Double  // Gaussian blur radius for focus map pre-processing
-    
+    private let levels: Int
+    private let blurRadius: Double
+
+    // ── Metal pipeline states — compiled ONCE at init, reused on every blend ──
+    private let clearTexPipeline:          MTLComputePipelineState
+    private let graySquaredPipeline:       MTLComputePipelineState
+    private let extractGrayGray2Pipeline:  MTLComputePipelineState
+    private let localVariancePipeline:     MTLComputePipelineState
+    private let wtaAccumulatePipeline:     MTLComputePipelineState
+    private let wtaFinalizePipeline:       MTLComputePipelineState
+    private let baExpandPipeline:          MTLComputePipelineState
+    private let binaryAddPipeline:         MTLComputePipelineState
+    private let binarySubPipeline:         MTLComputePipelineState
+    private let setAlphaPipeline:          MTLComputePipelineState
+    private let unsharpMaskPipeline:       MTLComputePipelineState
+    private let expandRRGBAPipeline:       MTLComputePipelineState
+    private let extractRRGBAPipeline:      MTLComputePipelineState
+    private let accumulateLevelPipeline:   MTLComputePipelineState
+    private let finalizeLevelPipeline:     MTLComputePipelineState
+    private let computeMaxWeightPipeline:  MTLComputePipelineState
+    private let compareMaxPipeline:        MTLComputePipelineState
+    private let normalizeFocusPipeline:    MTLComputePipelineState
+    private let averageDownsamplePipeline: MTLComputePipelineState
+    private let pointwisePipeline:         MTLComputePipelineState
+
+    // ── All Metal kernels in one library ─────────────────────────────────────
+    private static let combinedShaderSrc = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    kernel void clear_tex(texture2d<float, access::write> out [[texture(0)]], uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x < out.get_width() && gid.y < out.get_height()) out.write(float4(0), gid);
+    }
+
+    kernel void gray_squared(texture2d<float, access::read> lap [[texture(0)]],
+                              texture2d<float, access::write> out [[texture(1)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
+        float3 rgb = lap.read(gid).rgb;
+        float gray = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+        out.write(float4(gray * gray, 0, 0, 1), gid);
+    }
+
+    kernel void extract_gray_gray2(
+        texture2d<float, access::read>  inp   [[texture(0)]],
+        texture2d<float, access::write> outG  [[texture(1)]],
+        texture2d<float, access::write> outG2 [[texture(2)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= outG.get_width() || gid.y >= outG.get_height()) return;
+        float3 rgb = inp.read(gid).rgb;
+        float g = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+        outG.write(float4(g, 0, 0, 1), gid);
+        outG2.write(float4(g * g, 0, 0, 1), gid);
+    }
+
+    kernel void local_variance(
+        texture2d<float, access::read>  meanG  [[texture(0)]],
+        texture2d<float, access::read>  meanG2 [[texture(1)]],
+        texture2d<float, access::write> out    [[texture(2)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
+        float mg  = meanG.read(gid).r;
+        float mg2 = meanG2.read(gid).r;
+        out.write(float4(max(mg2 - mg * mg, 0.0f), 0, 0, 1), gid);
+    }
+
+    kernel void wta_accumulate(
+        texture2d<float, access::read>       laplacian [[texture(0)]],
+        texture2d<float, access::read>       weight    [[texture(1)]],
+        texture2d<float, access::read_write> accVal    [[texture(2)]],
+        texture2d<float, access::read_write> accW      [[texture(3)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= accVal.get_width() || gid.y >= accVal.get_height()) return;
+        float w    = weight.read(gid).r;
+        float curW = accW.read(gid).r;
+        if (w > curW) {
+            accVal.write(laplacian.read(gid), gid);
+            accW.write(float4(w, 0, 0, 1), gid);
+        }
+    }
+
+    kernel void wta_finalize(
+        texture2d<float, access::read>  accVal [[texture(0)]],
+        texture2d<float, access::write> output [[texture(1)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        float4 v = accVal.read(gid);
+        v.a = 1.0;
+        output.write(v, gid);
+    }
+
+    kernel void ba_expand(
+        texture2d<float, access::read>  input  [[texture(0)]],
+        texture2d<float, access::write> output [[texture(1)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        int ox = int(gid.x), oy = int(gid.y);
+        int sW = int(input.get_width()), sH = int(input.get_height());
+        float k[5] = {0.05f, 0.25f, 0.40f, 0.25f, 0.05f};
+        float4 sum = float4(0.0f);
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                int ex = ox - dx, ey = oy - dy;
+                if (((ex | ey) & 1) == 0) {
+                    int sx = clamp(ex / 2, 0, sW - 1);
+                    int sy = clamp(ey / 2, 0, sH - 1);
+                    sum += input.read(uint2(sx, sy)) * (k[dx+2] * k[dy+2]);
+                }
+            }
+        }
+        sum *= 4.0f;
+        sum.a = max(sum.a, 1.0f);
+        output.write(sum, gid);
+    }
+
+    kernel void binary_add(
+        texture2d<float, access::read>  texA   [[texture(0)]],
+        texture2d<float, access::read>  texB   [[texture(1)]],
+        texture2d<float, access::write> output [[texture(2)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        output.write(texA.read(gid) + texB.read(gid), gid);
+    }
+
+    kernel void binary_sub(
+        texture2d<float, access::read>  texA   [[texture(0)]],
+        texture2d<float, access::read>  texB   [[texture(1)]],
+        texture2d<float, access::write> output [[texture(2)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        output.write(texA.read(gid) - texB.read(gid), gid);
+    }
+
+    kernel void set_alpha(
+        texture2d<float, access::read>  input  [[texture(0)]],
+        texture2d<float, access::write> output [[texture(1)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        float4 color = input.read(gid);
+        color.a = 1.0;
+        output.write(color, gid);
+    }
+
+    kernel void unsharp_mask(
+        texture2d<float, access::read>  original [[texture(0)]],
+        texture2d<float, access::read>  blurred  [[texture(1)]],
+        texture2d<float, access::write> output   [[texture(2)]],
+        constant float &amount [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        float4 orig   = original.read(gid);
+        float4 blur   = blurred.read(gid);
+        float4 result = clamp(orig + amount * (orig - blur), 0.0f, 1.0f);
+        result.a = 1.0;
+        output.write(result, gid);
+    }
+
+    kernel void expand_r_rgba(
+        texture2d<float, access::read>  src [[texture(0)]],
+        texture2d<float, access::write> dst [[texture(1)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+        float r = src.read(gid).r;
+        dst.write(float4(r, r, r, 1.0), gid);
+    }
+
+    kernel void extract_r_rgba(
+        texture2d<float, access::read>  src [[texture(0)]],
+        texture2d<float, access::write> dst [[texture(1)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+        dst.write(float4(src.read(gid).r, 0.0, 0.0, 1.0), gid);
+    }
+
+    kernel void compute_max_weight(
+        texture2d<float, access::read>       weight [[texture(0)]],
+        texture2d<float, access::read_write> maxW   [[texture(1)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= maxW.get_width() || gid.y >= maxW.get_height()) return;
+        float w = max(0.0f, weight.read(gid).r);
+        float currentMax = maxW.read(gid).r;
+        if (w > currentMax) maxW.write(float4(w, 0.0f, 0.0f, 1.0f), gid);
+    }
+
+    kernel void compare_max(
+        texture2d<float, access::read>  weight [[texture(0)]],
+        texture2d<float, access::read>  maxW   [[texture(1)]],
+        texture2d<float, access::write> output [[texture(2)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        float w    = max(0.0f, weight.read(gid).r);
+        float m    = maxW.read(gid).r;
+        float outW = (m > 1e-6f && w >= m - 1e-6f) ? 1.0f : 0.0f;
+        output.write(float4(outW, outW, outW, 1.0f), gid);
+    }
+
+    kernel void normalize_focus(
+        texture2d<float, access::read>  input  [[texture(0)]],
+        texture2d<float, access::write> output [[texture(1)]],
+        constant float &minVal       [[buffer(0)]],
+        constant float &range        [[buffer(1)]],
+        constant float &effectiveMax [[buffer(2)]],
+        constant float &exponent     [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        if (range < 0.0001f) { output.write(float4(1.0), gid); return; }
+        float val        = input.read(gid).r;
+        float clamped    = min(val, effectiveMax);
+        float normalized = (clamped - minVal) / range;
+        float sharpened  = pow(normalized, exponent);
+        output.write(float4(sharpened, sharpened, sharpened, 1.0), gid);
+    }
+
+    kernel void average_downsample(
+        texture2d<float, access::read>  input  [[texture(0)]],
+        texture2d<float, access::write> output [[texture(1)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        int2 ip = int2(gid) * 2;
+        float4 sum = float4(0.0);
+        for (int dy = 0; dy < 2; dy++) {
+            for (int dx = 0; dx < 2; dx++) {
+                int2 sp = clamp(ip + int2(dx, dy), int2(0), int2(input.get_width()-1, input.get_height()-1));
+                sum += input.read(uint2(sp));
+            }
+        }
+        output.write(sum * 0.25, gid);
+    }
+
+    kernel void accumulate_level(
+        texture2d<float, access::read>       laplacian  [[texture(0)]],
+        texture2d<float, access::read>       weight     [[texture(1)]],
+        texture2d<float, access::read_write> accValue   [[texture(2)]],
+        texture2d<float, access::read_write> accWeight  [[texture(3)]],
+        constant bool &isBase [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= accValue.get_width() || gid.y >= accValue.get_height()) return;
+        float4 lapVal = laplacian.read(gid);
+        float  w      = max(0.0f, weight.read(gid).r);
+        accValue.write(accValue.read(gid)  + lapVal * w, gid);
+        accWeight.write(float4(accWeight.read(gid).r + w, 0, 0, 1), gid);
+    }
+
+    kernel void finalize_level(
+        texture2d<float, access::read>  accValue  [[texture(0)]],
+        texture2d<float, access::read>  accWeight [[texture(1)]],
+        texture2d<float, access::write> output    [[texture(2)]],
+        constant uint &count  [[buffer(0)]],
+        constant bool &isBase [[buffer(1)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+        float4 val = accValue.read(gid);
+        float  w   = accWeight.read(gid).r;
+        if (w > 1e-6f) val = val / w;
+        val.a = 1.0;
+        output.write(val, gid);
+    }
+
+    struct PointwiseParams { float eps; float padding[3]; };
+    kernel void pointwise(
+        texture2d<float, access::read>  A       [[texture(0)]],
+        texture2d<float, access::read>  B       [[texture(1)]],
+        texture2d<float, access::read>  C2      [[texture(2)]],
+        texture2d<float, access::write> Out     [[texture(3)]],
+        constant uint           &mode           [[buffer(0)]],
+        constant PointwiseParams &params        [[buffer(1)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= Out.get_width() || gid.y >= Out.get_height()) return;
+        float4 a  = A.read(gid);
+        float4 b  = B.read(gid);
+        float4 c2 = C2.read(gid);
+        float4 result;
+        switch (mode) {
+            case 0:  result = a * b;                break;
+            case 1:  result = a - b * b;            break;
+            case 2:  result = a - b * c2;           break;
+            case 3:  result = a / (b + params.eps); break;
+            case 4:  result = c2 - a * b;           break;
+            case 5:  result = a * b + c2;           break;
+            default: result = a;                    break;
+        }
+        result.a = 1.0;
+        Out.write(result, gid);
+    }
+    """
+
     // 7 levels: fine frequency decomposition matching Zerene PMax depth of detail
     public init(context: MetalContext, levels: Int = 7, blurRadius: Double = 2.5) {
         self.context = context
         self.levels = levels
         self.blurRadius = blurRadius
+        // Compile all shaders once — saves ~2000 recompilations across 90-image blend
+        let lib = try! context.device.makeLibrary(source: PyBlend.combinedShaderSrc, options: nil)
+        clearTexPipeline          = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "clear_tex")!)
+        graySquaredPipeline       = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "gray_squared")!)
+        extractGrayGray2Pipeline  = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "extract_gray_gray2")!)
+        localVariancePipeline     = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "local_variance")!)
+        wtaAccumulatePipeline     = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "wta_accumulate")!)
+        wtaFinalizePipeline       = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "wta_finalize")!)
+        baExpandPipeline          = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "ba_expand")!)
+        binaryAddPipeline         = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "binary_add")!)
+        binarySubPipeline         = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "binary_sub")!)
+        setAlphaPipeline          = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "set_alpha")!)
+        unsharpMaskPipeline       = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "unsharp_mask")!)
+        expandRRGBAPipeline       = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "expand_r_rgba")!)
+        extractRRGBAPipeline      = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "extract_r_rgba")!)
+        accumulateLevelPipeline   = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "accumulate_level")!)
+        finalizeLevelPipeline     = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "finalize_level")!)
+        computeMaxWeightPipeline  = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "compute_max_weight")!)
+        compareMaxPipeline        = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "compare_max")!)
+        normalizeFocusPipeline    = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "normalize_focus")!)
+        averageDownsamplePipeline = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "average_downsample")!)
+        pointwisePipeline         = try! context.device.makeComputePipelineState(function: lib.makeFunction(name: "pointwise")!)
     }
     
     /// Blend images using Laplacian pyramid method
@@ -24,56 +347,158 @@ public class PyBlend {
     ///   - images: Input images (already aligned)
     ///   - focusMaps: Focus quality maps for each image
     /// - Returns: Blended output texture
-    public func blend(images: [MTLTexture], focusMaps: [MTLTexture]) throws -> MTLTexture {
+    /// - Parameter progressCallback: Called at milestone images during blending (≈8 times total).
+    ///   Receives (imageIndex 0-based, total, partialResult) — partialResult is a full pyramid
+    ///   collapse of images accumulated so far, showing quality improving in real time.
+    public func blend(
+        images: [MTLTexture],
+        focusMaps: [MTLTexture],
+        progressCallback: ((Int, Int, MTLTexture) throws -> Void)? = nil
+    ) throws -> MTLTexture {
         guard images.count == focusMaps.count, !images.isEmpty else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid input"])
         }
-        
-        let _ = images[0].width
-        
+
         print("Pyramid blending: \(images.count) images, \(levels) levels")
-                // Step 0: (focus maps no longer used — base level now uses local variance like ShineStacker)
-        // Step 1: Build Gaussian pyramids for each image
-        print("  [1/3] Building Gaussian pyramids...")
-        var gaussianPyramids: [[MTLTexture]] = []
-        for image in images {
-            let pyramid = try buildGaussianPyramid(image)
-            gaussianPyramids.append(pyramid)
+
+        // Step 1: Pre-allocate per-level WTA accumulators (2 textures × levels).
+        // Memory cost: O(levels), completely independent of N.
+        // Old approach stored all N Gaussian + N Laplacian pyramids simultaneously
+        // → ~36 GB for 90 × 4 K frames → iMac crash.
+        print("  [1/3] Initialising per-level WTA accumulators (\(levels) levels)…")
+        let dimPyramid = try buildGaussianPyramid(images[0])
+        var accValues:  [MTLTexture] = []
+        var accWeights: [MTLTexture] = []
+        for lvl in 0..<levels {
+            let w = dimPyramid[lvl].width
+            let h = dimPyramid[lvl].height
+            let d = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            guard let av = context.device.makeTexture(descriptor: d),
+                  let aw = context.device.makeTexture(descriptor: d) else {
+                throw NSError(domain: "PyramidBlending", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "Failed to create level accumulator"])
+            }
+            try clearTexture(av)
+            try clearTexture(aw)
+            accValues.append(av)
+            accWeights.append(aw)
         }
-        
-        // Step 2: Build Laplacian pyramids from Gaussian pyramids
-        print("  [2/3] Building Laplacian pyramids...")
-        var laplacianPyramids: [[MTLTexture]] = []
-        for pyramid in gaussianPyramids {
-            let laplacian = try buildLaplacianPyramid(gaussianPyramid: pyramid)
-            laplacianPyramids.append(laplacian)
+
+        // Step 2: Stream each image through the pyramid one at a time.
+        // Only one image's Gaussian + Laplacian pyramid lives in GPU memory at once.
+        // ARC frees both pyramids at the end of each loop iteration.
+        // The WTA selection per pixel is mathematically identical to the batch version:
+        // WTA is commutative — order of images does not affect which pixel wins.
+        print("  [2/3] Streaming \(images.count) images through pyramid…")
+        for i in 0..<images.count {
+            let gaussPyramid = try buildGaussianPyramid(images[i])
+            let lapPyramid   = try buildLaplacianPyramid(gaussianPyramid: gaussPyramid)
+            for lvl in 0..<levels {
+                let isBase = (lvl == levels - 1)
+                let weight: MTLTexture = isBase
+                    ? try computeLocalVariance(lapPyramid[lvl])
+                    : try computeSmoothedLaplacianEnergy(lapPyramid[lvl])
+                try wtaAccumulateStep(value:    lapPyramid[lvl],
+                                     weight:   weight,
+                                     accValue: accValues[lvl],
+                                     accWeight: accWeights[lvl])
+            }
+            // gaussPyramid and lapPyramid go out of scope here → ARC releases GPU textures.
+
+            // Progressive preview at milestones: snapshot current accumulators → collapse → callback.
+            // Produces ~8 full-quality previews regardless of N, each showing more images blended.
+            // Cost per snapshot = one collapsePyramid call (fixed, independent of N).
+            if let cb = progressCallback {
+                let interval = max(5, images.count / 8)
+                if (i + 1) % interval == 0 || i == images.count - 1 {
+                    var snapPyramid: [MTLTexture] = []
+                    for lvl in 0..<levels {
+                        snapPyramid.append(try wtaFinalizeLevel(accValues[lvl]))
+                    }
+                    let snapResult = try collapsePyramid(snapPyramid)
+                    // collapsePyramid ends with async GPU ops (unsharpMask, setAlphaToOne).
+                    // Without this fence, the snapshot texture has alpha=0 → renders black.
+                    // An empty command buffer in the same queue completes only after all
+                    // previously-enqueued work has finished (Metal queues are ordered).
+                    if let fence = context.commandQueue.makeCommandBuffer() {
+                        fence.commit()
+                        fence.waitUntilCompleted()
+                    }
+                    try cb(i, images.count, snapResult)
+                }
+            }
         }
-        gaussianPyramids.removeAll()
-        
-        // Step 3: Blend using ShineStacker's per-level algorithm:
-        // - Detail levels: convolve(gray²) → hard WTA (fuse_laplacian)
-        // - Base level: local variance → hard WTA (get_fused_base / deviation)
-        print("  [3/3] Blending pyramids (ShineStacker per-level energy)...")
-        let blendedPyramid = try blendPyramidsPerLevelEnergy(
-            laplacianPyramids: laplacianPyramids,
-            baseWeightPyramids: []
-        )
-        
-        laplacianPyramids.removeAll()
-        
-        // Step 4: Collapse pyramid to final image
-        print("  Collapsing pyramid to final image...")
+
+        // Step 3: Finalize each level accumulator → blended pyramid → collapse.
+        print("  [3/3] Finalising and collapsing pyramid…")
+        var blendedPyramid: [MTLTexture] = []
+        for lvl in 0..<levels {
+            blendedPyramid.append(try wtaFinalizeLevel(accValues[lvl]))
+        }
+
         let result = try collapsePyramid(blendedPyramid)
-        
+
         // CRITICAL: Wait for ALL GPU operations to complete before returning
         if let commandBuffer = context.commandQueue.makeCommandBuffer() {
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
         }
-        
+
         return result
     }
-    
+
+    /// Streaming WTA accumulate step: update (accValue, accWeight) for one image.
+    /// Called once per image per pyramid level.  Uses the same wta_accumulate kernel
+    /// as the batch path — pixel-level output is identical.
+    private func wtaAccumulateStep(value: MTLTexture, weight: MTLTexture,
+                                   accValue: MTLTexture, accWeight: MTLTexture) throws {
+        let tg  = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (value.width+15)/16, height: (value.height+15)/16, depth: 1)
+        guard let cmd = context.commandQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyBlend", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
+        }
+        enc.setComputePipelineState(wtaAccumulatePipeline)
+        enc.setTexture(value,     index: 0)
+        enc.setTexture(weight,    index: 1)
+        enc.setTexture(accValue,  index: 2)
+        enc.setTexture(accWeight, index: 3)
+        enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+    }
+
+    /// Finalize a WTA accumulator into a clean output texture (copies + sets alpha=1).
+    private func wtaFinalizeLevel(_ accValue: MTLTexture) throws -> MTLTexture {
+        let w = accValue.width, h = accValue.height
+        let outDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
+        outDesc.usage = [.shaderRead, .shaderWrite]
+        guard let output = context.device.makeTexture(descriptor: outDesc) else {
+            throw NSError(domain: "PyBlend", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create output texture"])
+        }
+        let tg  = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (w+15)/16, height: (h+15)/16, depth: 1)
+        guard let cmd = context.commandQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw NSError(domain: "PyBlend", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
+        }
+        enc.setComputePipelineState(wtaFinalizePipeline)
+        enc.setTexture(accValue, index: 0)
+        enc.setTexture(output,   index: 1)
+        enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return output
+    }
+
     /// Build Gaussian pyramid (repeated downsampling)
     private func buildGaussianPyramid(_ image: MTLTexture) throws -> [MTLTexture] {
         var pyramid: [MTLTexture] = [image]
@@ -171,25 +596,11 @@ public class PyBlend {
             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create squared texture"])
         }
 
-        let squareSrc = """
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void gray_squared(texture2d<float, access::read> lap [[texture(0)]],
-                                  texture2d<float, access::write> out [[texture(1)]],
-                                  uint2 gid [[thread_position_in_grid]]) {
-            if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
-            float3 rgb = lap.read(gid).rgb;
-            float gray = dot(rgb, float3(0.2126, 0.7152, 0.0722));
-            out.write(float4(gray * gray, 0, 0, 1), gid);
-        }
-        """
-        let sqLib = try context.device.makeLibrary(source: squareSrc, options: nil)
-        let sqPipeline = try context.device.makeComputePipelineState(function: sqLib.makeFunction(name: "gray_squared")!)
         guard let sqCmd = context.commandQueue.makeCommandBuffer(),
               let sqEnc = sqCmd.makeComputeCommandEncoder() else {
             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
         }
-        sqEnc.setComputePipelineState(sqPipeline)
+        sqEnc.setComputePipelineState(graySquaredPipeline)
         sqEnc.setTexture(laplacian, index: 0)
         sqEnc.setTexture(squaredTex, index: 1)
         let tg = MTLSize(width: 16, height: 16, depth: 1)
@@ -216,31 +627,13 @@ public class PyBlend {
         }
 
         // Extract grayscale and gray² in one pass
-        let src = """
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void extract_gray_gray2(
-            texture2d<float, access::read> inp [[texture(0)]],
-            texture2d<float, access::write> outG [[texture(1)]],
-            texture2d<float, access::write> outG2 [[texture(2)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= outG.get_width() || gid.y >= outG.get_height()) return;
-            float3 rgb = inp.read(gid).rgb;
-            float g = dot(rgb, float3(0.2126, 0.7152, 0.0722));
-            outG.write(float4(g, 0, 0, 1), gid);
-            outG2.write(float4(g * g, 0, 0, 1), gid);
-        }
-        """
-        let lib = try context.device.makeLibrary(source: src, options: nil)
-        let pipe = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "extract_gray_gray2")!)
         guard let cmd = context.commandQueue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder() else {
             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed cmd"])
         }
         let tg = MTLSize(width: 16, height: 16, depth: 1)
         let tgc = MTLSize(width: (width+15)/16, height: (height+15)/16, depth: 1)
-        enc.setComputePipelineState(pipe)
+        enc.setComputePipelineState(extractGrayGray2Pipeline)
         enc.setTexture(laplacian, index: 0)
         enc.setTexture(grayTex, index: 1)
         enc.setTexture(gray2Tex, index: 2)
@@ -259,29 +652,11 @@ public class PyBlend {
         guard let varTex = context.device.makeTexture(descriptor: varDesc) else {
             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed var tex"])
         }
-        let varSrc = """
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void local_variance(
-            texture2d<float, access::read> meanG  [[texture(0)]],
-            texture2d<float, access::read> meanG2 [[texture(1)]],
-            texture2d<float, access::write> out   [[texture(2)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
-            float mg  = meanG.read(gid).r;
-            float mg2 = meanG2.read(gid).r;
-            float v = max(mg2 - mg * mg, 0.0f);
-            out.write(float4(v, 0, 0, 1), gid);
-        }
-        """
-        let varLib  = try context.device.makeLibrary(source: varSrc, options: nil)
-        let varPipe = try context.device.makeComputePipelineState(function: varLib.makeFunction(name: "local_variance")!)
         guard let cmd2 = context.commandQueue.makeCommandBuffer(),
               let enc2 = cmd2.makeComputeCommandEncoder() else {
             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed cmd2"])
         }
-        enc2.setComputePipelineState(varPipe)
+        enc2.setComputePipelineState(localVariancePipeline)
         enc2.setTexture(meanG, index: 0)
         enc2.setTexture(meanG2, index: 1)
         enc2.setTexture(varTex, index: 2)
@@ -308,53 +683,17 @@ public class PyBlend {
         try clearTexture(accValue)
         try clearTexture(accWeight)
         
-        let shaderSrc = """
-        #include <metal_stdlib>
-        using namespace metal;
-        
-        // Hard WTA: keep the pixel with the highest weight per-pixel.
-        kernel void wta_accumulate(
-            texture2d<float, access::read> laplacian [[texture(0)]],
-            texture2d<float, access::read> weight [[texture(1)]],
-            texture2d<float, access::read_write> accVal [[texture(2)]],
-            texture2d<float, access::read_write> accW [[texture(3)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= accVal.get_width() || gid.y >= accVal.get_height()) return;
-            float w = weight.read(gid).r;
-            float curW = accW.read(gid).r;
-            if (w > curW) {
-                accVal.write(laplacian.read(gid), gid);
-                accW.write(float4(w, 0, 0, 1), gid);
-            }
-        }
-        
-        kernel void wta_finalize(
-            texture2d<float, access::read> accVal [[texture(0)]],
-            texture2d<float, access::write> output [[texture(1)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
-            float4 v = accVal.read(gid);
-            v.a = 1.0;
-            output.write(v, gid);
-        }
-        """
-        let lib = try context.device.makeLibrary(source: shaderSrc, options: nil)
-        let accumPipeline = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "wta_accumulate")!)
-        let finPipeline   = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "wta_finalize")!)
-        
         let tg  = MTLSize(width: 16, height: 16, depth: 1)
         let tgc = MTLSize(width: (width+15)/16, height: (height+15)/16, depth: 1)
-        
+
         guard let cmd = context.commandQueue.makeCommandBuffer() else {
             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
         }
-        
+
         // Accumulate: per-frame WTA
         for i in 0..<laplacianLevels.count {
             guard let enc = cmd.makeComputeCommandEncoder() else { continue }
-            enc.setComputePipelineState(accumPipeline)
+            enc.setComputePipelineState(wtaAccumulatePipeline)
             enc.setTexture(laplacianLevels[i], index: 0)
             enc.setTexture(weightLevels[i], index: 1)
             enc.setTexture(accValue, index: 2)
@@ -370,7 +709,7 @@ public class PyBlend {
               let enc2 = cmd.makeComputeCommandEncoder() else {
             throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create output texture"])
         }
-        enc2.setComputePipelineState(finPipeline)
+        enc2.setComputePipelineState(wtaFinalizePipeline)
         enc2.setTexture(accValue, index: 0)
         enc2.setTexture(output, index: 1)
         enc2.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
@@ -399,67 +738,7 @@ public class PyBlend {
         try clearTexture(accValueTexture)
         try clearTexture(accWeightTexture) // Max weight tracker
         
-        // 2. Setup GPU Pipeline for Accumulation
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-        
-        kernel void accumulate_level(
-            texture2d<float, access::read> laplacian [[texture(0)]],
-            texture2d<float, access::read> weight [[texture(1)]],
-            texture2d<float, access::read_write> accValue [[texture(2)]],
-            texture2d<float, access::read_write> accWeight [[texture(3)]],
-            constant bool &isBase [[buffer(0)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= accValue.get_width() || gid.y >= accValue.get_height()) {
-                return;
-            }
-            
-            float4 lapVal = laplacian.read(gid);
-            float w = max(0.0f, weight.read(gid).r);
-            
-            float4 curAccVal = accValue.read(gid);
-            float curAccW = accWeight.read(gid).r;
-            
-            // Standard Burt-Adelson multi-scale blending
-            accValue.write(curAccVal + lapVal * w, gid);
-            accWeight.write(float4(curAccW + w, 0.0, 0.0, 1.0), gid);
-        }
-        
-        kernel void finalize_level(
-            texture2d<float, access::read> accValue [[texture(0)]],
-            texture2d<float, access::read> accWeight [[texture(1)]],
-            texture2d<float, access::write> output [[texture(2)]],
-            constant uint &count [[buffer(0)]],
-            constant bool &isBase [[buffer(1)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
-                return;
-            }
-            
-            float4 val = accValue.read(gid);
-            float  w   = accWeight.read(gid).r;
-            
-            // Soft blend normalize
-            if (w > 1e-6f) {
-                val = val / w;
-            }
-            
-            val.a = 1.0;
-            output.write(val, gid);
-        }
-        """
-        
-        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let accumulateFunction = library.makeFunction(name: "accumulate_level")!
-        let finalizeFunction = library.makeFunction(name: "finalize_level")!
-        
-        let accumulatePipeline = try context.device.makeComputePipelineState(function: accumulateFunction)
-        let finalizePipeline = try context.device.makeComputePipelineState(function: finalizeFunction)
-        
-        // 3. Accumulation Pass: Loop through all images
+        // 3. Accumulation Pass: Loop through all images (uses cached accumulateLevelPipeline)
         guard let commandBuffer = context.commandQueue.makeCommandBuffer() else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create cmd buffer"])
         }
@@ -475,7 +754,7 @@ public class PyBlend {
         var baseFlag = isBase
         for i in 0..<laplacianLevels.count {
             guard let encoder = commandBuffer.makeComputeCommandEncoder() else { continue }
-            encoder.setComputePipelineState(accumulatePipeline)
+            encoder.setComputePipelineState(accumulateLevelPipeline)
             encoder.setTexture(laplacianLevels[i], index: 0)
             encoder.setTexture(weightLevels[i], index: 1)
             encoder.setTexture(accValueTexture, index: 2)
@@ -493,7 +772,7 @@ public class PyBlend {
              throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create output texture"])
         }
         
-        encoder.setComputePipelineState(finalizePipeline)
+        encoder.setComputePipelineState(finalizeLevelPipeline)
         encoder.setTexture(accValueTexture, index: 0)
         encoder.setTexture(accWeightTexture, index: 1)
         encoder.setTexture(outputTexture, index: 2)
@@ -515,19 +794,8 @@ public class PyBlend {
     
     /// Helper to clear a texture to zero
     private func clearTexture(_ texture: MTLTexture) throws {
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void clear_tex(texture2d<float, access::write> out [[texture(0)]], uint2 gid [[thread_position_in_grid]]) {
-            if (gid.x < out.get_width() && gid.y < out.get_height()) out.write(float4(0), gid);
-        }
-        """
-        let lib = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let f = lib.makeFunction(name: "clear_tex")!
-        let pipeline = try context.device.makeComputePipelineState(function: f)
-        
         guard let cmd = context.commandQueue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(pipeline)
+        enc.setComputePipelineState(clearTexPipeline)
         enc.setTexture(texture, index: 0)
         let groups = MTLSize(width: (texture.width+15)/16, height: (texture.height+15)/16, depth: 1)
         enc.dispatchThreadgroups(groups, threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
@@ -541,46 +809,6 @@ public class PyBlend {
         guard weights.count > 1 else { return weights }
         let width = weights[0].width
         let height = weights[0].height
-
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        kernel void compute_max_weight(
-            texture2d<float, access::read>       weight [[texture(0)]],
-            texture2d<float, access::read_write> maxW   [[texture(1)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= maxW.get_width() || gid.y >= maxW.get_height()) return;
-            float w = max(0.0f, weight.read(gid).r);
-            float currentMax = maxW.read(gid).r;
-            if (w > currentMax) {
-                maxW.write(float4(w, 0.0f, 0.0f, 1.0f), gid);
-            }
-        }
-
-        kernel void compare_max(
-            texture2d<float, access::read>  weight [[texture(0)]],
-            texture2d<float, access::read>  maxW   [[texture(1)]],
-            texture2d<float, access::write> output [[texture(2)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
-            float w = max(0.0f, weight.read(gid).r);
-            float m = maxW.read(gid).r;
-            
-            // Giữ lại 1.0 nếu là ảnh rõ nét nhất, ngoại trừ các điểm đen hoàn toàn
-            float outW = 0.0f;
-            if (m > 1e-6f && w >= m - 1e-6f) {
-                outW = 1.0f;
-            }
-            output.write(float4(outW, outW, outW, 1.0f), gid);
-        }
-        """
-
-        let lib = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let computeMaxPipeline = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "compute_max_weight")!)
-        let comparePipeline    = try context.device.makeComputePipelineState(function: lib.makeFunction(name: "compare_max")!)
 
         let tg      = MTLSize(width: 16, height: 16, depth: 1)
         let tgCount = MTLSize(width: (width+15)/16, height: (height+15)/16, depth: 1)
@@ -599,7 +827,7 @@ public class PyBlend {
         }
         for weight in weights {
             guard let enc = cmd1.makeComputeCommandEncoder() else { continue }
-            enc.setComputePipelineState(computeMaxPipeline)
+            enc.setComputePipelineState(computeMaxWeightPipeline)
             enc.setTexture(weight, index: 0)
             enc.setTexture(maxTexture, index: 1)
             enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tg)
@@ -620,7 +848,7 @@ public class PyBlend {
                 throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create output texture"])
             }
             guard let enc = cmd2.makeComputeCommandEncoder() else { continue }
-            enc.setComputePipelineState(comparePipeline)
+            enc.setComputePipelineState(compareMaxPipeline)
             enc.setTexture(weight, index: 0)
             enc.setTexture(maxTexture, index: 1)
             enc.setTexture(outTex, index: 2)
@@ -720,49 +948,12 @@ public class PyBlend {
         
         let range = effectiveMax - minVal
         
-        // Define GPU Kernel for Normalization
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-        
-        kernel void normalize_focus(
-            texture2d<float, access::read> input [[texture(0)]],
-            texture2d<float, access::write> output [[texture(1)]],
-            constant float &minVal [[buffer(0)]],
-            constant float &range [[buffer(1)]],
-            constant float &effectiveMax [[buffer(2)]],
-            constant float &exponent [[buffer(3)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
-                return;
-            }
-            
-            // Handle uniform case or empty range
-            if (range < 0.0001) {
-                output.write(float4(1.0, 1.0, 1.0, 1.0), gid);
-                return;
-            }
-            
-            float val = input.read(gid).r;
-            float clamped = min(val, effectiveMax);
-            float normalized = (clamped - minVal) / range;
-            float sharpened = pow(normalized, exponent);
-            
-            output.write(float4(sharpened, sharpened, sharpened, 1.0), gid);
-        }
-        """
-        
-        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let function = library.makeFunction(name: "normalize_focus")!
-        let pipeline = try context.device.makeComputePipelineState(function: function)
-        
         guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
         }
         
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(normalizeFocusPipeline)
         encoder.setTexture(focusMap, index: 0)
         encoder.setTexture(outputTexture, index: 1)
         
@@ -816,25 +1007,6 @@ public class PyBlend {
     
     /// Set alpha channel to 1.0 for all pixels
     private func setAlphaToOne(_ texture: MTLTexture) throws -> MTLTexture {
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-        
-        kernel void set_alpha(
-            texture2d<float, access::read> input [[texture(0)]],
-            texture2d<float, access::write> output [[texture(1)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
-                return;
-            }
-            
-            float4 color = input.read(gid);
-            color.a = 1.0;
-            output.write(color, gid);
-        }
-        """
-        
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba32Float,
             width: texture.width,
@@ -842,21 +1014,14 @@ public class PyBlend {
             mipmapped: false
         )
         textureDescriptor.usage = [.shaderRead, .shaderWrite]
-        
         guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
         }
-        
-        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let function = library.makeFunction(name: "set_alpha")!
-        let pipeline = try context.device.makeComputePipelineState(function: function)
-        
         guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
         }
-        
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(setAlphaPipeline)
         encoder.setTexture(texture, index: 0)
         encoder.setTexture(outputTexture, index: 1)
         
@@ -941,47 +1106,11 @@ public class PyBlend {
         guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
         }
-        
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-        
-        kernel void average_downsample(
-            texture2d<float, access::read> input [[texture(0)]],
-            texture2d<float, access::write> output [[texture(1)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
-                return;
-            }
-            
-            // Sample 2x2 block from input
-            int2 input_pos = int2(gid) * 2;
-            
-            float4 sum = float4(0.0);
-            for (int dy = 0; dy < 2; dy++) {
-                for (int dx = 0; dx < 2; dx++) {
-                    int2 sample_pos = clamp(input_pos + int2(dx, dy), 
-                                           int2(0), 
-                                           int2(input.get_width()-1, input.get_height()-1));
-                    sum += input.read(uint2(sample_pos));
-                }
-            }
-            
-            output.write(sum * 0.25, gid);
-        }
-        """
-        
-        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let function = library.makeFunction(name: "average_downsample")!
-        let pipeline = try context.device.makeComputePipelineState(function: function)
-        
         guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
         }
-        
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(averageDownsamplePipeline)
         encoder.setTexture(texture, index: 0)
         encoder.setTexture(outputTexture, index: 1)
         
@@ -1012,57 +1141,11 @@ public class PyBlend {
         guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
         }
-        
-        // Burt-Adelson 1983 correct expand: zero-interleave then 4 * convolve.
-        // kernel a=0.4: k = [0.05, 0.25, 0.40, 0.25, 0.05]
-        // CRITICAL: must NOT normalize by kernel sum — the ×4 scale is energy-conserving.
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        kernel void ba_expand(
-            texture2d<float, access::read>  input  [[texture(0)]],
-            texture2d<float, access::write> output [[texture(1)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
-            int ox = int(gid.x);
-            int oy = int(gid.y);
-            int sW = int(input.get_width());
-            int sH = int(input.get_height());
-            // Burt-Adelson a=0.4 generating kernel
-            float k[5] = {0.05f, 0.25f, 0.40f, 0.25f, 0.05f};
-            float4 sum = float4(0.0f);
-            for (int dy = -2; dy <= 2; dy++) {
-                for (int dx = -2; dx <= 2; dx++) {
-                    // Position in expanded (zero-interleaved) grid
-                    int ex = ox - dx;
-                    int ey = oy - dy;
-                    // Only even expanded positions have source values
-                    if (((ex | ey) & 1) == 0) {
-                        int sx = clamp(ex / 2, 0, sW - 1);
-                        int sy = clamp(ey / 2, 0, sH - 1);
-                        sum += input.read(uint2(sx, sy)) * (k[dx+2] * k[dy+2]);
-                    }
-                }
-            }
-            // ×4 factor from Burt-Adelson expand (energy conservation)
-            sum *= 4.0f;
-            sum.a = max(sum.a, 1.0f);
-            output.write(sum, gid);
-        }
-        """
-        
-        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let function = library.makeFunction(name: "ba_expand")!
-        let pipeline = try context.device.makeComputePipelineState(function: function)
-        
         guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
         }
-        
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(baExpandPipeline)
         encoder.setTexture(texture, index: 0)
         encoder.setTexture(outputTexture, index: 1)
         
@@ -1082,14 +1165,14 @@ public class PyBlend {
     }
     
     private func subtract(_ a: MTLTexture, _ b: MTLTexture) throws -> MTLTexture {
-        return try applyBinaryOp(a, b, operation: "a - b")
+        return try applyBinaryOp(a, b, pipeline: binarySubPipeline)
     }
     
     private func add(_ a: MTLTexture, _ b: MTLTexture) throws -> MTLTexture {
-        return try applyBinaryOp(a, b, operation: "a + b")
+        return try applyBinaryOp(a, b, pipeline: binaryAddPipeline)
     }
     
-    private func applyBinaryOp(_ a: MTLTexture, _ b: MTLTexture, operation: String) throws -> MTLTexture {
+    private func applyBinaryOp(_ a: MTLTexture, _ b: MTLTexture, pipeline: MTLComputePipelineState) throws -> MTLTexture {
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba32Float,
             width: a.width,
@@ -1101,32 +1184,6 @@ public class PyBlend {
         guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
         }
-        
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-        
-        kernel void binary_op(
-            texture2d<float, access::read> texA [[texture(0)]],
-            texture2d<float, access::read> texB [[texture(1)]],
-            texture2d<float, access::write> output [[texture(2)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
-                return;
-            }
-            
-            float4 a = texA.read(gid);
-            float4 b = texB.read(gid);
-            float4 result = \(operation);
-            
-            output.write(result, gid);
-        }
-        """
-        
-        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let function = library.makeFunction(name: "binary_op")!
-        let pipeline = try context.device.makeComputePipelineState(function: function)
         
         guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -1149,7 +1206,6 @@ public class PyBlend {
         encoder.endEncoding()
         
         commandBuffer.commit()
-        // Async GPU - no wait needed
         
         return outputTexture
     }
@@ -1157,61 +1213,18 @@ public class PyBlend {
     /// Apply unsharp mask for edge enhancement
     /// Formula: Output = Original + Amount * (Original - Blurred)
     private func unsharpMask(_ texture: MTLTexture, amount: Float = 0.8, radius: Float = 1.5) throws -> MTLTexture {
-        // First, create a blurred version
         let blurred = try gaussianBlur(texture, radius: radius)
-        
-        // Then apply unsharp mask formula
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-        
-        kernel void unsharp_mask(
-            texture2d<float, access::read> original [[texture(0)]],
-            texture2d<float, access::read> blurred [[texture(1)]],
-            texture2d<float, access::write> output [[texture(2)]],
-            constant float &amount [[buffer(0)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
-                return;
-            }
-            
-            float4 orig = original.read(gid);
-            float4 blur = blurred.read(gid);
-            
-            // Unsharp mask: Original + Amount * (Original - Blurred)
-            float4 result = orig + amount * (orig - blur);
-            
-            // Clamp to valid range [0, 1] to prevent overshooting
-            result = clamp(result, 0.0, 1.0);
-            result.a = 1.0;
-            
-            output.write(result, gid);
-        }
-        """
-        
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba32Float,
-            width: texture.width,
-            height: texture.height,
-            mipmapped: false
-        )
+            pixelFormat: .rgba32Float, width: texture.width, height: texture.height, mipmapped: false)
         textureDescriptor.usage = [.shaderRead, .shaderWrite]
-        
         guard let outputTexture = context.device.makeTexture(descriptor: textureDescriptor) else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
         }
-        
-        let library = try context.device.makeLibrary(source: shaderSource, options: nil)
-        let function = library.makeFunction(name: "unsharp_mask")!
-        let pipeline = try context.device.makeComputePipelineState(function: function)
-        
         guard let commandBuffer = context.commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
         }
-        
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(unsharpMaskPipeline)
         encoder.setTexture(texture, index: 0)
         encoder.setTexture(blurred, index: 1)
         encoder.setTexture(outputTexture, index: 2)
@@ -1293,32 +1306,8 @@ public class PyBlend {
                           userInfo: [NSLocalizedDescriptionKey: "Failed to create RGBA blur textures"])
         }
 
-        let shaderSrc = """
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void expand_r_rgba(
-            texture2d<float, access::read>  src [[texture(0)]],
-            texture2d<float, access::write> dst [[texture(1)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
-            float r = src.read(gid).r;
-            dst.write(float4(r, r, r, 1.0), gid);
-        }
-        kernel void extract_r_rgba(
-            texture2d<float, access::read>  src [[texture(0)]],
-            texture2d<float, access::write> dst [[texture(1)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
-            dst.write(float4(src.read(gid).r, 0.0, 0.0, 1.0), gid);
-        }
-        """
-        let lib = try context.device.makeLibrary(source: shaderSrc, options: nil)
-        let expandPipe  = try context.device.makeComputePipelineState(
-            function: lib.makeFunction(name: "expand_r_rgba")!)
-        let extractPipe = try context.device.makeComputePipelineState(
-            function: lib.makeFunction(name: "extract_r_rgba")!)
+        let expandPipe  = expandRRGBAPipeline
+        let extractPipe = extractRRGBAPipeline
 
         let tg  = MTLSize(width: 16, height: 16, depth: 1)
         let tgc = MTLSize(width: (width + 15) / 16, height: (height + 15) / 16, depth: 1)
@@ -1435,51 +1424,7 @@ public class PyBlend {
         // 10. mean_b = box(b)
         // 11. q      = mean_a * I + mean_b
 
-        // Inline Metal kernel source for element-wise ops (one kernel handles many ops via a mode flag).
-        let src = """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        // mode 0: c = a * b (each channel independently)
-        // mode 1: c = a * b  (same — split just for clarity)
-        // mode 2: c = a - b * b   (variance: mean_X2 - mean_X^2)
-        // mode 3: c = a - b * c2  (covariance: mean_Ip - mean_I * mean_p)
-        // mode 4: c = a / (b + eps)
-        // mode 5: c = a - b * c2  (b  = mean_p, b*c2 = a * mean_I; b here is reused)
-        // mode 6: c = a * b + c2   (final: mean_a * I + mean_b)
-
-        struct Params { float eps; float padding[3]; };
-
-        kernel void pointwise(
-            texture2d<float, access::read>  A       [[texture(0)]],
-            texture2d<float, access::read>  B       [[texture(1)]],
-            texture2d<float, access::read>  C2      [[texture(2)]],
-            texture2d<float, access::write> Out     [[texture(3)]],
-            constant uint  &mode                    [[buffer(0)]],
-            constant Params &params                 [[buffer(1)]],
-            uint2 gid [[thread_position_in_grid]])
-        {
-            if (gid.x >= Out.get_width() || gid.y >= Out.get_height()) return;
-            float4 a  = A.read(gid);
-            float4 b  = B.read(gid);
-            float4 c2 = C2.read(gid);
-            float4 result;
-            switch (mode) {
-                case 0:  result = a * b;               break; // I*p or I*I
-                case 1:  result = a - b * b;           break; // var_I = mean_I2 - mean_I^2
-                case 2:  result = a - b * c2;          break; // cov_Ip = mean_Ip - mean_I*mean_p
-                case 3:  result = a / (b + params.eps);break; // a = cov/var
-                case 4:  result = c2 - a * b;          break; // b_coeff = mean_p - a*mean_I
-                case 5:  result = a * b + c2;          break; // q = mean_a*I + mean_b
-                default: result = a;                   break;
-            }
-            result.a = 1.0;
-            Out.write(result, gid);
-        }
-        """
-        let lib = try context.device.makeLibrary(source: src, options: nil)
-        let fn  = lib.makeFunction(name: "pointwise")!
-        let pl  = try context.device.makeComputePipelineState(function: fn)
+        let pl  = pointwisePipeline
 
         struct GFParams { var eps: Float; var pad: (Float,Float,Float) = (0,0,0) }
         var gfp = GFParams(eps: eps)

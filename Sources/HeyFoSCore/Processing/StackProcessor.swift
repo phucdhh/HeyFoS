@@ -189,28 +189,43 @@ public final class StackProcessor {
         logger.info("✓ Color consistency normalization complete")
         
         // Step 3.8: Incremental DepthMap previews (Zerene-style progressive reveal)
-        // For each image i, quick-blend the first i images and emit a partial preview.
-        // Uses GPU DepthMap WTA which is fast enough for live feedback.
+        // Uses O(1)-per-step streaming WTA so total cost is O(N) not O(N²).
+        // Each call only processes the one new image against the running best-so-far state.
         if let callback = partialPreviewCallback {
             logger.info("Generating \(normalizedImages.count) incremental preview frames…")
             let quickBlender = DepthMap(context: metalContext)
-            for i in 1...normalizedImages.count {
-                let pct = 0.60 + Double(i) / Double(normalizedImages.count) * 0.20
-                progressHandler?(pct, "Stacking image \(i)/\(normalizedImages.count)…")
-                let partialImages    = Array(normalizedImages[0..<i])
-                let partialFocusMaps = Array(focusMaps[0..<i])
-                let partial = try quickBlender.blend(images: partialImages, focusMaps: partialFocusMaps)
-                try callback(i - 1, normalizedImages.count, partial)
+            var previewTex: MTLTexture? = nil
+            var scoreTex: MTLTexture? = nil
+            for i in 0..<normalizedImages.count {
+                let pct = 0.60 + Double(i + 1) / Double(normalizedImages.count) * 0.20
+                progressHandler?(pct, "Stacking image \(i + 1)/\(normalizedImages.count)…")
+                (previewTex, scoreTex) = try quickBlender.blendPreviewStep(
+                    newImage: normalizedImages[i],
+                    newFocusMap: focusMaps[i],
+                    bestImage: previewTex,
+                    bestScore: scoreTex
+                )
+                try callback(i, normalizedImages.count, previewTex!)
             }
         }
 
         // Step 4: Perform blending
-        progressHandler?(0.82, "Final blend: \(images.count) images…")
+        progressHandler?(0.82, "Final blend: 0/\(normalizedImages.count)…")
         let result: MTLTexture
         if usePyramidBlending {
             logger.info("Performing PyBlend (Pyramid Blending)...")
             let blender = PyBlend(context: metalContext, levels: pyramidLevels, blurRadius: blurRadius)
-            result = try blender.blend(images: normalizedImages, focusMaps: focusMaps)
+            result = try blender.blend(
+                images: normalizedImages,
+                focusMaps: focusMaps,
+                progressCallback: { current, total, preview in
+                    // Advance progress bar 0.82 → 0.95 across the blend loop
+                    let pct = 0.82 + Double(current + 1) / Double(total) * 0.13
+                    progressHandler?(pct, "Final blend: \(current + 1)/\(total)…")
+                    // Reuse partialPreviewCallback so the UI updates with improving-quality previews
+                    try partialPreviewCallback?(current, total, preview)
+                }
+            )
             logger.info("✓ PyBlend complete")
         } else {
             logger.info("Performing DepthMap blending...")
