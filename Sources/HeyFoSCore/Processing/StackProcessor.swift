@@ -213,6 +213,11 @@ public final class StackProcessor {
         progressHandler?(0.10, "Stacking 1/\(n)…")
         // firstImage, firstGray, firstFocusMap go out of scope below
 
+        // Rate-limit intermediate previews: at most one update every ~n/15 images.
+        // Without this, 96 images × 145 MB NSImage = 14 GB queued on the main thread
+        // before SwiftUI can process them, causing extreme memory pressure → SIGSEGV.
+        let previewEvery = max(1, n / 15)
+
         // ── PMax: single streaming pass (images 1…N-1) ──────────────────────
         if usePyramidBlending {
             for idx in 1..<n {
@@ -232,7 +237,7 @@ public final class StackProcessor {
 
                     try blender.pMaxStreamAccumulate(image: image, accValues: accValues, accWeights: accWeights)
 
-                    if partialPreviewCallback != nil {
+                    if partialPreviewCallback != nil && idx % previewEvery == 0 {
                         (previewTex, previewScore) = try quickBlender.blendPreviewStep(
                             newImage: image, newFocusMap: focusMap,
                             bestImage: previewTex, bestScore: previewScore)
@@ -279,7 +284,7 @@ public final class StackProcessor {
 
                     try quickBlender.dmapPhase1Accumulate(focusMap: focusMap, state: &dmapS)
 
-                    if partialPreviewCallback != nil {
+                    if partialPreviewCallback != nil && idx % previewEvery == 0 {
                         (previewTex, previewScore) = try quickBlender.blendPreviewStep(
                             newImage: image, newFocusMap: focusMap,
                             bestImage: previewTex, bestScore: previewScore)

@@ -295,7 +295,11 @@ final class ProcessingState: ObservableObject {
                 let partialPreviewCallback: (Int, Int, MTLTexture) throws -> Void = { [weak self] idx, total, texture in
                     guard let self, !self._isCancelled else { throw CancellationError() }
                     let preview = self.textureToNSImage(texture)
-                    DispatchQueue.main.async {
+                    // Use sync instead of async: blocks the background thread until the main
+                    // thread has consumed this NSImage (releasing the previous one). This
+                    // prevents multiple full-res NSImages (each ~145 MB) from accumulating on
+                    // the main queue → eliminates 14 GB memory buildup when processing 96+ images.
+                    DispatchQueue.main.sync {
                         self.currentStackingIndex = idx
                         self.totalStackingImages = total
                         self.livePreviewImage = preview
