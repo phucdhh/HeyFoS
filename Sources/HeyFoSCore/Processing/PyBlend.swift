@@ -620,9 +620,16 @@ public class PyBlend {
         var currentImage = image
         
         for _ in 1..<levels {
-            let downsampledImage = try gaussianDownsample(currentImage)
-            pyramid.append(downsampledImage)
-            currentImage = downsampledImage
+            try autoreleasepool {
+                let downsampledImage = try gaussianDownsample(currentImage)
+                pyramid.append(downsampledImage)
+                currentImage = downsampledImage
+                // Avoid queuing all downsamples at once
+                if let cmd = context.commandQueue.makeCommandBuffer() {
+                    cmd.commit()
+                    cmd.waitUntilCompleted()
+                }
+            }
         }
         
         return pyramid
@@ -633,14 +640,21 @@ public class PyBlend {
         var laplacianPyramid: [MTLTexture] = []
         
         for i in 0..<(gaussianPyramid.count - 1) {
-            let current = gaussianPyramid[i]
-            let next = gaussianPyramid[i + 1]
-            
-            // Upsample next level and subtract from current
-            let upsampled = try upsample(next, targetWidth: current.width, targetHeight: current.height)
-            let difference = try subtract(current, upsampled)
-            
-            laplacianPyramid.append(difference)
+            try autoreleasepool {
+                let current = gaussianPyramid[i]
+                let next = gaussianPyramid[i + 1]
+                
+                // Upsample next level and subtract from current
+                let upsampled = try upsample(next, targetWidth: current.width, targetHeight: current.height)
+                let difference = try subtract(current, upsampled)
+                
+                laplacianPyramid.append(difference)
+                // Drain memory immediately for each level subtraction
+                if let cmd = context.commandQueue.makeCommandBuffer() {
+                    cmd.commit()
+                    cmd.waitUntilCompleted()
+                }
+            }
         }
         
         // Add the smallest Gaussian level as the last Laplacian level
@@ -1106,16 +1120,35 @@ public class PyBlend {
         
         // Upsample and add each level
         for i in stride(from: pyramid.count - 2, through: 0, by: -1) {
-            let level = pyramid[i]
-            let upsampled = try upsample(current, targetWidth: level.width, targetHeight: level.height)
-            current = try add(upsampled, level)
+            try autoreleasepool {
+                let level = pyramid[i]
+                let upsampled = try upsample(current, targetWidth: level.width, targetHeight: level.height)
+                current = try add(upsampled, level)
+                // Wait to free `upsampled` and the previous `current` out of GPU memory
+                // before allocating the next level (up to 576 MB each).
+                if let cmd = context.commandQueue.makeCommandBuffer() {
+                    cmd.commit()
+                    cmd.waitUntilCompleted()
+                }
+            }
         }
         
         // Subtle sharpening only. High amounts amplify any residual halos.
         current = try unsharpMask(current, amount: 0.3, radius: 1.0)
         
+        if let cmd = context.commandQueue.makeCommandBuffer() {
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        }
+        
         // Ensure alpha channel is 1.0
         current = try setAlphaToOne(current)
+        
+        // Final sync
+        if let cmd = context.commandQueue.makeCommandBuffer() {
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        }
         
         return current
     }
@@ -1151,7 +1184,7 @@ public class PyBlend {
         encoder.endEncoding()
         
         commandBuffer.commit()
-        // Async GPU - no wait needed
+        commandBuffer.waitUntilCompleted()
         
         return outputTexture
     }
