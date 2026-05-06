@@ -153,15 +153,27 @@ public final class StackProcessor {
         logger.info("Alignment check: \(useAlignment)")
         logger.info("Pyramid blending: \(usePyramidBlending)")
         logger.info("Pyramid levels: \(pyramidLevels), blur radius: \(blurRadius)")
-        
+
+        // ── Adaptive resolution cap ───────────────────────────────────────────
+        // images + focusMaps are held in GPU memory simultaneously (each rgba32Float).
+        // Budget 40 % of physical RAM for both arrays combined to avoid OOM/swapping.
+        // Aspect ratio assumed 4:3; cap is clamped to [1024, 3840].
+        let imageURLs = try getAllImageURLs(inputDirectory)
+        let imageCount = max(1, imageURLs.count)
+        let ramBytes = Double(ProcessInfo.processInfo.physicalMemory)
+        let budgetPerImage = 0.40 * ramBytes / Double(imageCount) / 2.0   // ÷2 for images+focusMaps
+        let adaptiveDim = min(3840, max(1024, Int(sqrt(budgetPerImage / 16.0 * 4.0 / 3.0))))
+        logger.info("Adaptive maxDimension: \(adaptiveDim) px  (RAM: \(Int(ramBytes/1e9)) GB, \(imageCount) images)")
+        progressHandler?(0.01, "Preparing… (\(imageCount) images, max \(adaptiveDim) px)")
+
         // Step 1: Load images
         // Debug image source first
         if verbose {
-             ImageLoaderDebug.inspectImageSource(url: try self.getAllImageURLs(inputDirectory)[0])
+             ImageLoaderDebug.inspectImageSource(url: imageURLs[0])
         }
         
-        progressHandler?(0.05, "Loading images… 0/?")
-        let images = try loadImagesFromDirectory(inputDirectory, perImageProgress: { done, total in
+        progressHandler?(0.05, "Loading images… 0/\(imageCount)")
+        let images = try loadImagesFromDirectory(inputDirectory, maxDimension: adaptiveDim, perImageProgress: { done, total in
             let pct = 0.05 + 0.14 * Double(done) / Double(total)
             progressHandler?(pct, "Loading images… \(done)/\(total)")
         })

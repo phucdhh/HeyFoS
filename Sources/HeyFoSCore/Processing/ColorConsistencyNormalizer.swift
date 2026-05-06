@@ -21,16 +21,16 @@ final class ColorConsistencyNormalizer {
     private static let scaleShaderSrc = """
     #include <metal_stdlib>
     using namespace metal;
-    kernel void scale_exposure(
-        texture2d<float, access::read>  input  [[texture(0)]],
-        texture2d<float, access::write> output [[texture(1)]],
-        constant float &scale [[buffer(0)]],
+    // read_write access — scales the texture in-place with no extra allocation
+    kernel void scale_exposure_inplace(
+        texture2d<float, access::read_write> tex   [[texture(0)]],
+        constant float                      &scale [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]])
     {
-        if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
-        float4 px = input.read(gid);
+        if (gid.x >= tex.get_width() || gid.y >= tex.get_height()) return;
+        float4 px = tex.read(gid);
         px = float4(clamp(px.rgb * scale, 0.0, 1.0), px.a);
-        output.write(px, gid);
+        tex.write(px, gid);
     }
     """
 
@@ -39,7 +39,7 @@ final class ColorConsistencyNormalizer {
         let lib = try! context.device.makeLibrary(
             source: ColorConsistencyNormalizer.scaleShaderSrc, options: nil)
         scalePipeline = try! context.device.makeComputePipelineState(
-            function: lib.makeFunction(name: "scale_exposure")!)
+            function: lib.makeFunction(name: "scale_exposure_inplace")!)
     }
 
     /// Returns a new array of textures with matched luminance.
@@ -107,24 +107,39 @@ final class ColorConsistencyNormalizer {
         let refMean = luminances[referenceIdx]
         logger.info("Color consistency: reference frame \(referenceIdx) mean luminance = \(String(format: "%.4f", refMean))")
 
-        // ── Phase 3: submit all scale operations as a single GPU batch ───────────
-        // Result textures are consumed by downstream GPU work on the same command queue;
-        // Metal queue ordering guarantees they are written before they are read.
-        var results = [MTLTexture](repeating: images[0], count: images.count)
+        // ── Phase 3: in-place scale on GPU — zero extra texture allocations ─────
+        // Encoding all scale ops into one command buffer and committing once
+        // avoids the per-frame waitUntilCompleted that caused the crash pattern.
+        guard let batchCmd = context.commandQueue.makeCommandBuffer() else { return images }
         for (i, img) in images.enumerated() {
-            if i == referenceIdx { results[i] = img; continue }
+            if i == referenceIdx { continue }
             let frameMean = luminances[i]
-            guard frameMean > 1e-6 else { results[i] = img; continue }
+            guard frameMean > 1e-6 else { continue }
 
             let rawScale = refMean / frameMean
             let scale    = Float(min(max(rawScale, 0.70), 1.40))
-            if abs(scale - 1.0) < 0.02 { results[i] = img; continue }
+            if abs(scale - 1.0) < 0.02 { continue }
 
             logger.debug("  Frame \(i): mean=\(String(format: "%.4f", frameMean)) scale=\(String(format: "%.3f", scale))")
-            results[i] = try applyLuminanceScale(img, scale: scale)
-        }
 
-        return results
+            guard let enc = batchCmd.makeComputeCommandEncoder() else { continue }
+            enc.setComputePipelineState(scalePipeline)
+            enc.setTexture(img, index: 0)   // read_write — same texture, no copy
+            var s = scale
+            enc.setBytes(&s, length: MemoryLayout<Float>.size, index: 0)
+            let tg = MTLSize(width: 16, height: 16, depth: 1)
+            let tgCount = MTLSize(
+                width:  (img.width  + 15) / 16,
+                height: (img.height + 15) / 16,
+                depth: 1)
+            enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tg)
+            enc.endEncoding()
+        }
+        batchCmd.commit()
+        batchCmd.waitUntilCompleted()
+
+        // Return the same array — every texture was modified in-place
+        return images
     }
 
     // MARK: - Private
@@ -184,41 +199,23 @@ final class ColorConsistencyNormalizer {
         return Double(mean)
     }
 
-    /// Apply a uniform RGB scale correction via a Metal kernel.
-    private func applyLuminanceScale(_ texture: MTLTexture, scale: Float) throws -> MTLTexture {
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: texture.pixelFormat,
-            width: texture.width, height: texture.height,
-            mipmapped: false
-        )
-        desc.usage = [.shaderRead, .shaderWrite]
-
-        guard let outTex = context.device.makeTexture(descriptor: desc) else {
-            return texture
-        }
-
+    /// Apply a uniform RGB scale correction in-place via a Metal kernel.
+    /// (Kept for backward compatibility; normalize() now uses the batch path above.)
+    private func applyLuminanceScale(_ texture: MTLTexture, scale: Float) throws {
         guard let cmdBuf = context.commandQueue.makeCommandBuffer(),
-              let enc = cmdBuf.makeComputeCommandEncoder() else {
-            return texture
-        }
-
+              let enc    = cmdBuf.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(scalePipeline)
         enc.setTexture(texture, index: 0)
-        enc.setTexture(outTex, index: 1)
         var s = scale
         enc.setBytes(&s, length: MemoryLayout<Float>.size, index: 0)
-
         let tg = MTLSize(width: 16, height: 16, depth: 1)
         let tgCount = MTLSize(
-            width: (texture.width + 15) / 16,
+            width:  (texture.width  + 15) / 16,
             height: (texture.height + 15) / 16,
-            depth: 1
-        )
+            depth: 1)
         enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tg)
         enc.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
-
-        return outTex
     }
 }
