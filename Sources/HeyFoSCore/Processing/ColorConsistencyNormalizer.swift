@@ -153,28 +153,33 @@ final class ColorConsistencyNormalizer {
         var results = [Double](repeating: 0.5, count: urls.count)
         let smallSize = 64
         DispatchQueue.concurrentPerform(iterations: urls.count) { i in
-            let opts: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-                kCGImageSourceCreateThumbnailWithTransform:     false,
-                kCGImageSourceThumbnailMaxPixelSize:            smallSize
-            ]
-            guard let src = CGImageSourceCreateWithURL(urls[i] as CFURL, nil),
-                  let cg  = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
-            else { return }
-            let w = cg.width, h = cg.height, n = w * h
-            var raw = [UInt8](repeating: 0, count: n * 4)
-            guard let ctx = CGContext(
-                data: &raw, width: w, height: h,
-                bitsPerComponent: 8, bytesPerRow: w * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-            ) else { return }
-            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-            var luma = 0.0
-            for j in 0..<n {
-                luma += 0.2126 * Double(raw[j*4]) + 0.7152 * Double(raw[j*4+1]) + 0.0722 * Double(raw[j*4+2])
+            // autoreleasepool: CGImageSourceCreateWithURL, CGImageSourceCreateThumbnailAtIndex,
+            // and CGContext are Obj-C objects. Without this, they accumulate across all N
+            // concurrent iterations before being freed.
+            autoreleasepool {
+                let opts: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+                    kCGImageSourceCreateThumbnailWithTransform:     false,
+                    kCGImageSourceThumbnailMaxPixelSize:            smallSize
+                ]
+                guard let src = CGImageSourceCreateWithURL(urls[i] as CFURL, nil),
+                      let cg  = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+                else { return }
+                let w = cg.width, h = cg.height, n = w * h
+                var raw = [UInt8](repeating: 0, count: n * 4)
+                guard let ctx = CGContext(
+                    data: &raw, width: w, height: h,
+                    bitsPerComponent: 8, bytesPerRow: w * 4,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+                ) else { return }
+                ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+                var luma = 0.0
+                for j in 0..<n {
+                    luma += 0.2126 * Double(raw[j*4]) + 0.7152 * Double(raw[j*4+1]) + 0.0722 * Double(raw[j*4+2])
+                }
+                results[i] = luma / (Double(n) * 255.0)   // each i is unique — no data race
             }
-            results[i] = luma / (Double(n) * 255.0)   // each i is unique — no data race
         }
         return results
     }

@@ -216,35 +216,52 @@ public final class StackProcessor {
         // ── PMax: single streaming pass (images 1…N-1) ──────────────────────
         if usePyramidBlending {
             for idx in 1..<n {
-                let pct = 0.10 + Double(idx) / Double(n) * 0.80
-                progressHandler?(pct, "Stacking \(idx+1)/\(n)…")
+                // autoreleasepool: drains Obj-C MPS temporaries (MPSImageGaussianBlur etc.)
+                // that accumulate inside gaussianBlur/computeSmoothedLaplacianEnergy.
+                // Without this, N×levels×MPS temporaries pile up → memory pressure → SIGSEGV.
+                try autoreleasepool {
+                    let pct = 0.10 + Double(idx) / Double(n) * 0.80
+                    progressHandler?(pct, "Stacking \(idx+1)/\(n)…")
 
-                let image = try loadSingleImage(from: imageURLs[idx], maxDimension: maxDimension)
-                let scale = colorNormalizer.luminanceScale(frameIdx: idx, referenceIdx: referenceIdx, luminances: luminances)
-                try colorNormalizer.applyScaleInPlace(image, scale: scale)
+                    let image = try loadSingleImage(from: imageURLs[idx], maxDimension: maxDimension)
+                    let scale = colorNormalizer.luminanceScale(frameIdx: idx, referenceIdx: referenceIdx, luminances: luminances)
+                    try colorNormalizer.applyScaleInPlace(image, scale: scale)
 
-                let gray     = try focusProcessor.convertToGrayscale(inputTexture: image)
-                let focusMap = try focusProcessor.computeFocusMeasure(inputTexture: gray, method: method)
+                    let gray     = try focusProcessor.convertToGrayscale(inputTexture: image)
+                    let focusMap = try focusProcessor.computeFocusMeasure(inputTexture: gray, method: method)
 
-                try blender.pMaxStreamAccumulate(image: image, accValues: accValues, accWeights: accWeights)
+                    try blender.pMaxStreamAccumulate(image: image, accValues: accValues, accWeights: accWeights)
 
-                if partialPreviewCallback != nil {
-                    (previewTex, previewScore) = try quickBlender.blendPreviewStep(
-                        newImage: image, newFocusMap: focusMap,
-                        bestImage: previewTex, bestScore: previewScore)
-                    try partialPreviewCallback?(idx, n, previewTex!)
+                    if partialPreviewCallback != nil {
+                        (previewTex, previewScore) = try quickBlender.blendPreviewStep(
+                            newImage: image, newFocusMap: focusMap,
+                            bestImage: previewTex, bestScore: previewScore)
+                        try partialPreviewCallback?(idx, n, previewTex!)
+                    }
+                    // image, gray, focusMap freed at end of autoreleasepool block
                 }
-                // image, gray, focusMap go out of scope → GPU memory freed by ARC
             }
+
+            // Free WTA preview accumulators — no longer needed for the final PyBlend pass.
+            // Frees ~700 MB before finalization to reduce peak memory.
+            previewTex = nil
+            previewScore = nil
 
             progressHandler?(0.91, "Finalising…")
             let result = try blender.pMaxStreamFinalize(accValues: accValues, accWeights: accWeights)
-            // Replace last WTA preview with high-quality PyBlend output
-            try partialPreviewCallback?(n - 1, n, result)
+
+            // Free pyramid accumulators immediately after finalization — frees ~1.8 GB
+            // before saveTexture reads the result, preventing memory-pressure purging.
+            accValues = []
+            accWeights = []
 
             progressHandler?(0.95, "Saving result…")
             let outputURL = URL(fileURLWithPath: outputPath)
             try imageLoader.saveTexture(result, to: outputURL)
+
+            // Show final PyBlend result AFTER saving so textureToNSImage's ~700 MB
+            // allocation doesn't compete with saveTexture's readback.
+            try partialPreviewCallback?(n - 1, n, result)
 
         } else {
             // ── DMap Pass 1: stream focus maps to build per-pixel max score ─────
@@ -255,19 +272,21 @@ public final class StackProcessor {
                 let pct = 0.10 + Double(idx) / Double(n) * 0.35
                 progressHandler?(pct, "Analysing depth \(idx+1)/\(n)…")
 
-                let image    = try loadSingleImage(from: imageURLs[idx], maxDimension: maxDimension)
-                let gray     = try focusProcessor.convertToGrayscale(inputTexture: image)
-                let focusMap = try focusProcessor.computeFocusMeasure(inputTexture: gray, method: method)
+                try autoreleasepool {
+                    let image    = try loadSingleImage(from: imageURLs[idx], maxDimension: maxDimension)
+                    let gray     = try focusProcessor.convertToGrayscale(inputTexture: image)
+                    let focusMap = try focusProcessor.computeFocusMeasure(inputTexture: gray, method: method)
 
-                try quickBlender.dmapPhase1Accumulate(focusMap: focusMap, state: &dmapS)
+                    try quickBlender.dmapPhase1Accumulate(focusMap: focusMap, state: &dmapS)
 
-                if partialPreviewCallback != nil {
-                    (previewTex, previewScore) = try quickBlender.blendPreviewStep(
-                        newImage: image, newFocusMap: focusMap,
-                        bestImage: previewTex, bestScore: previewScore)
-                    try partialPreviewCallback?(idx, n, previewTex!)
+                    if partialPreviewCallback != nil {
+                        (previewTex, previewScore) = try quickBlender.blendPreviewStep(
+                            newImage: image, newFocusMap: focusMap,
+                            bestImage: previewTex, bestScore: previewScore)
+                        try partialPreviewCallback?(idx, n, previewTex!)
+                    }
+                    // image, gray, focusMap freed at end of autoreleasepool block
                 }
-                // image, gray, focusMap freed here
             }
 
             // ── DMap Pass 2: re-stream images with softmax pyramid blend ─────
@@ -287,26 +306,38 @@ public final class StackProcessor {
                 let pct = 0.46 + Double(idx) / Double(n) * 0.44
                 progressHandler?(pct, "Blending \(idx+1)/\(n)…")
 
-                let image = try loadSingleImage(from: imageURLs[idx], maxDimension: maxDimension)
-                let scale = colorNormalizer.luminanceScale(frameIdx: idx, referenceIdx: referenceIdx, luminances: luminances)
-                try colorNormalizer.applyScaleInPlace(image, scale: scale)
+                try autoreleasepool {
+                    let image = try loadSingleImage(from: imageURLs[idx], maxDimension: maxDimension)
+                    let scale = colorNormalizer.luminanceScale(frameIdx: idx, referenceIdx: referenceIdx, luminances: luminances)
+                    try colorNormalizer.applyScaleInPlace(image, scale: scale)
 
-                let gray     = try focusProcessor.convertToGrayscale(inputTexture: image)
-                let focusMap = try focusProcessor.computeFocusMeasure(inputTexture: gray, method: method)
+                    let gray     = try focusProcessor.convertToGrayscale(inputTexture: image)
+                    let focusMap = try focusProcessor.computeFocusMeasure(inputTexture: gray, method: method)
 
-                try quickBlender.dmapPhase2Accumulate(
-                    image: image, focusMap: focusMap, state: dmapS,
-                    accValues: accValues, accWeights: accWeights, pyramidBlender: blender)
-                // image, gray, focusMap freed here
+                    try quickBlender.dmapPhase2Accumulate(
+                        image: image, focusMap: focusMap, state: dmapS,
+                        accValues: accValues, accWeights: accWeights, pyramidBlender: blender)
+                    // image, gray, focusMap freed here
+                }
             }
+
+            // Free WTA preview accumulators before finalization
+            previewTex = nil
+            previewScore = nil
 
             progressHandler?(0.91, "Finalising…")
             let result = try blender.softBlendFinalize(accValues: accValues, accWeights: accWeights)
-            try partialPreviewCallback?(n - 1, n, result)
+
+            // Free accumulators immediately after finalization — frees ~1.8 GB before save
+            accValues = []
+            accWeights = []
 
             progressHandler?(0.95, "Saving result…")
             let outputURL = URL(fileURLWithPath: outputPath)
             try imageLoader.saveTexture(result, to: outputURL)
+
+            // Show final result AFTER saving
+            try partialPreviewCallback?(n - 1, n, result)
         }
 
         progressHandler?(1.00, "Complete!")

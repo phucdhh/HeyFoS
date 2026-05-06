@@ -451,14 +451,19 @@ public class PyBlend {
         let gaussPyramid = try buildGaussianPyramid(image)
         let lapPyramid   = try buildLaplacianPyramid(gaussianPyramid: gaussPyramid)
         for lvl in 0..<levels {
-            let isBase = (lvl == levels - 1)
-            let weight: MTLTexture = isBase
-                ? try computeLocalVariance(lapPyramid[lvl])
-                : try computeSmoothedLaplacianEnergy(lapPyramid[lvl])
-            try wtaAccumulateStep(value:    lapPyramid[lvl],
-                                  weight:   weight,
-                                  accValue: accValues[lvl],
-                                  accWeight: accWeights[lvl])
+            // autoreleasepool: frees MPS temporaries (from computeSmoothedLaplacianEnergy
+            // / computeLocalVariance → gaussianBlur → MPSImageGaussianBlur) after each
+            // pyramid level instead of letting them accumulate across all 127 images.
+            try autoreleasepool {
+                let isBase = (lvl == levels - 1)
+                let weight: MTLTexture = isBase
+                    ? try computeLocalVariance(lapPyramid[lvl])
+                    : try computeSmoothedLaplacianEnergy(lapPyramid[lvl])
+                try wtaAccumulateStep(value:    lapPyramid[lvl],
+                                      weight:   weight,
+                                      accValue: accValues[lvl],
+                                      accWeight: accWeights[lvl])
+            }
         }
         // gaussPyramid and lapPyramid go out of scope → ARC releases GPU textures
     }
@@ -1375,9 +1380,6 @@ public class PyBlend {
             return try gaussianBlurR32(texture, sigma: sigma)
         }
 
-        let blur = MPSImageGaussianBlur(device: context.device, sigma: sigma)
-        blur.edgeMode = .clamp
-
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: texture.pixelFormat,
             width: texture.width,
@@ -1390,12 +1392,20 @@ public class PyBlend {
             throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create texture"])
         }
 
-        guard let commandBuffer = context.commandQueue.makeCommandBuffer() else {
-            throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+        // Wrap MPS object in autoreleasepool so the Obj-C MPSImageGaussianBlur and its
+        // internal temporaries are freed promptly instead of accumulating across all images.
+        try autoreleasepool {
+            let blur = MPSImageGaussianBlur(device: context.device, sigma: sigma)
+            blur.edgeMode = .clamp
+            guard let commandBuffer = context.commandQueue.makeCommandBuffer() else {
+                throw NSError(domain: "PyramidBlending", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create command buffer"])
+            }
+            blur.encode(commandBuffer: commandBuffer, sourceTexture: texture, destinationTexture: outputTexture)
+            commandBuffer.commit()
+            // Wait here so MPS objects are no longer referenced by a pending command buffer
+            // when the autoreleasepool drains. Prevents MPS temporaries from accumulating.
+            commandBuffer.waitUntilCompleted()
         }
-
-        blur.encode(commandBuffer: commandBuffer, sourceTexture: texture, destinationTexture: outputTexture)
-        commandBuffer.commit()
 
         return outputTexture
     }
