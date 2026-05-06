@@ -358,6 +358,139 @@ public class DepthMap {
         return tex
     }
 
+    // MARK: - Public Streaming API for DMap
+
+    /// Mutable state shared between DMap Phase 1 and Phase 2 streaming passes.
+    public struct DMapStreamingState {
+        public var curScore:     MTLTexture   // per-pixel max blurred focus score
+        public var nxtScore:     MTLTexture   // ping-pong buffer
+        public var blurTmpTex:   MTLTexture   // scratch for blur horizontal pass
+        public var focusBlurred: MTLTexture   // scratch for blurred focus map
+        public var softmaxWtTex: MTLTexture   // scratch for per-pixel softmax weight
+        public let width:        Int
+        public let height:       Int
+    }
+
+    /// Allocate work textures and initialise maxScore to –1 (less than any real score).
+    /// Call once before Phase 1 streaming.
+    public func makeDMapStreamingState(width: Int, height: Int) throws -> DMapStreamingState {
+        let cur     = try createTexture(width: width, height: height, format: .r32Float)
+        let nxt     = try createTexture(width: width, height: height, format: .r32Float)
+        let tmp     = try createTexture(width: width, height: height, format: .r32Float)
+        let blurred = try createTexture(width: width, height: height, format: .r32Float)
+        let softmax = try createTexture(width: width, height: height, format: .r32Float)
+        let tg  = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (width+15)/16, height: (height+15)/16, depth: 1)
+        guard let initCmd = context.commandQueue.makeCommandBuffer(),
+              let initEnc = initCmd.makeComputeCommandEncoder() else {
+            throw NSError(domain: "DepthMap", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "makeDMapStreamingState: init cmd failed"])
+        }
+        initEnc.setComputePipelineState(initScorePipe)
+        initEnc.setTexture(cur, index: 0)
+        initEnc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        initEnc.endEncoding()
+        initCmd.commit()
+        initCmd.waitUntilCompleted()
+        return DMapStreamingState(curScore: cur, nxtScore: nxt,
+                                  blurTmpTex: tmp, focusBlurred: blurred,
+                                  softmaxWtTex: softmax, width: width, height: height)
+    }
+
+    /// Phase 1 (streaming): blur one image's focus map and update the per-pixel max score.
+    /// Call once per image in order.  `state.curScore` accumulates the running maximum.
+    public func dmapPhase1Accumulate(focusMap: MTLTexture, state: inout DMapStreamingState) throws {
+        var sigma: Float = 5.0
+        let tg  = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (state.width+15)/16, height: (state.height+15)/16, depth: 1)
+        guard let cmd = context.commandQueue.makeCommandBuffer() else {
+            throw NSError(domain: "DepthMap", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Phase1: cmd alloc failed"])
+        }
+        guard let encH = cmd.makeComputeCommandEncoder() else { throw NSError() }
+        encH.setComputePipelineState(blurHPipe)
+        encH.setTexture(focusMap,          index: 0)
+        encH.setTexture(state.blurTmpTex,  index: 1)
+        encH.setBytes(&sigma, length: 4,   index: 0)
+        encH.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        encH.endEncoding()
+
+        guard let encV = cmd.makeComputeCommandEncoder() else { throw NSError() }
+        encV.setComputePipelineState(blurVPipe)
+        encV.setTexture(state.blurTmpTex,   index: 0)
+        encV.setTexture(state.focusBlurred, index: 1)
+        encV.setBytes(&sigma, length: 4,    index: 0)
+        encV.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        encV.endEncoding()
+
+        guard let encUpd = cmd.makeComputeCommandEncoder() else { throw NSError() }
+        encUpd.setComputePipelineState(updateScoreOnlyPipe)
+        encUpd.setTexture(state.focusBlurred, index: 0)
+        encUpd.setTexture(state.curScore,     index: 1)
+        encUpd.setTexture(state.nxtScore,     index: 2)
+        encUpd.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        encUpd.endEncoding()
+
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        swap(&state.curScore, &state.nxtScore)  // curScore is now updated
+    }
+
+    /// Phase 2 (streaming): compute softmax weight from the (now final) maxScore and
+    /// pyramid-accumulate one image.  Must be called after all Phase 1 calls finish.
+    /// `pyramidBlender` must be initialised with `makeSoftBlendAccumulators(forImage:)`.
+    public func dmapPhase2Accumulate(
+        image:          MTLTexture,
+        focusMap:       MTLTexture,
+        state:          DMapStreamingState,
+        accValues:      [MTLTexture],
+        accWeights:     [MTLTexture],
+        pyramidBlender: PyBlend
+    ) throws {
+        var sigma:      Float = 5.0
+        var tempFactor: Float = 0.3
+        let tg  = MTLSize(width: 16, height: 16, depth: 1)
+        let tgc = MTLSize(width: (state.width+15)/16, height: (state.height+15)/16, depth: 1)
+        guard let cmd = context.commandQueue.makeCommandBuffer() else {
+            throw NSError(domain: "DepthMap", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Phase2: cmd alloc failed"])
+        }
+        // Blur focus map (σ=5, same as Phase 1)
+        guard let encH = cmd.makeComputeCommandEncoder() else { throw NSError() }
+        encH.setComputePipelineState(blurHPipe)
+        encH.setTexture(focusMap,          index: 0)
+        encH.setTexture(state.blurTmpTex,  index: 1)
+        encH.setBytes(&sigma, length: 4,   index: 0)
+        encH.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        encH.endEncoding()
+
+        guard let encV = cmd.makeComputeCommandEncoder() else { throw NSError() }
+        encV.setComputePipelineState(blurVPipe)
+        encV.setTexture(state.blurTmpTex,   index: 0)
+        encV.setTexture(state.focusBlurred, index: 1)
+        encV.setBytes(&sigma, length: 4,    index: 0)
+        encV.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        encV.endEncoding()
+
+        // Softmax weight: w = exp((score - maxScore) / (maxScore × tempFactor))
+        guard let encSW = cmd.makeComputeCommandEncoder() else { throw NSError() }
+        encSW.setComputePipelineState(softmaxWeightPipe)
+        encSW.setTexture(state.focusBlurred, index: 0)
+        encSW.setTexture(state.curScore,     index: 1)   // final maxScore from Phase 1
+        encSW.setTexture(state.softmaxWtTex, index: 2)
+        encSW.setBytes(&tempFactor, length: 4, index: 0)
+        encSW.dispatchThreadgroups(tgc, threadsPerThreadgroup: tg)
+        encSW.endEncoding()
+
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // Laplacian pyramid × softmax weight → pyramid accumulators
+        try pyramidBlender.softBlendAccumulateImage(
+            image, weightMap: state.softmaxWtTex,
+            accValues: accValues, accWeights: accWeights)
+    }
+
     private func blendGPU(
         images: [MTLTexture],
         focusMaps: [MTLTexture],

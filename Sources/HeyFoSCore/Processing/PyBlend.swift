@@ -430,9 +430,50 @@ public class PyBlend {
 
     // MARK: - DMap Streaming Pyramid Blend (soft weighted-average at each scale)
 
+    // MARK: - Public Streaming API (PMax + DMap)
+
+    /// Allocate per-level WTA accumulators for streaming PMax blend.
+    /// Call once before starting the per-image loop. Memory cost: O(levels).
+    public func makeWTAAccumulators(forImage image: MTLTexture) throws -> ([MTLTexture], [MTLTexture]) {
+        return try makeSoftBlendAccumulators(forImage: image)
+    }
+
+    /// Accumulate one image using PMax per-level Laplacian-energy weights (streaming).
+    /// Mathematically equivalent to the inner loop of `blend(images:focusMaps:)`.
+    /// Both `image` pyramids are freed by ARC when this method returns.
+    /// - Note: Call `makeWTAAccumulators(forImage:)` once before this, then call
+    ///         `pMaxStreamFinalize` after all images are accumulated.
+    public func pMaxStreamAccumulate(
+        image: MTLTexture,
+        accValues: [MTLTexture],
+        accWeights: [MTLTexture]
+    ) throws {
+        let gaussPyramid = try buildGaussianPyramid(image)
+        let lapPyramid   = try buildLaplacianPyramid(gaussianPyramid: gaussPyramid)
+        for lvl in 0..<levels {
+            let isBase = (lvl == levels - 1)
+            let weight: MTLTexture = isBase
+                ? try computeLocalVariance(lapPyramid[lvl])
+                : try computeSmoothedLaplacianEnergy(lapPyramid[lvl])
+            try wtaAccumulateStep(value:    lapPyramid[lvl],
+                                  weight:   weight,
+                                  accValue: accValues[lvl],
+                                  accWeight: accWeights[lvl])
+        }
+        // gaussPyramid and lapPyramid go out of scope → ARC releases GPU textures
+    }
+
+    /// Finalize PMax streaming blend. Call once after all images have been accumulated.
+    public func pMaxStreamFinalize(
+        accValues: [MTLTexture],
+        accWeights: [MTLTexture]
+    ) throws -> MTLTexture {
+        return try softBlendFinalize(accValues: accValues, accWeights: accWeights)
+    }
+
     /// Allocate per-level soft-blend accumulators for DMap-style pyramid blend.
     /// Call once before the per-image loop. Memory cost: O(levels).
-    internal func makeSoftBlendAccumulators(forImage image: MTLTexture) throws -> ([MTLTexture], [MTLTexture]) {
+    public func makeSoftBlendAccumulators(forImage image: MTLTexture) throws -> ([MTLTexture], [MTLTexture]) {
         let dimPyramid = try buildGaussianPyramid(image)
         var accValues:  [MTLTexture] = []
         var accWeights: [MTLTexture] = []
@@ -458,8 +499,8 @@ public class PyBlend {
     /// Accumulate one image + its R32Float weight map into the pyramid accumulators.
     /// Uses WTA (Winner-Takes-All) at each Laplacian pyramid level: the image with the
     /// highest softmax weight at each pixel/scale wins — same principle as the sharp preview.
-    internal func softBlendAccumulateImage(_ image: MTLTexture, weightMap: MTLTexture,
-                                           accValues: [MTLTexture], accWeights: [MTLTexture]) throws {
+    public func softBlendAccumulateImage(_ image: MTLTexture, weightMap: MTLTexture,
+                                          accValues: [MTLTexture], accWeights: [MTLTexture]) throws {
         // 1. Expand R32Float weight → RGBA32Float (gaussianDownsample needs RGBA)
         let rgbaWeight    = try expandRToRGBA(weightMap)
         // 2. Build pyramids
@@ -476,7 +517,7 @@ public class PyBlend {
     }
 
     /// Finalize and collapse the WTA-accumulated pyramid to produce the final blended image.
-    internal func softBlendFinalize(accValues: [MTLTexture], accWeights: [MTLTexture]) throws -> MTLTexture {
+    public func softBlendFinalize(accValues: [MTLTexture], accWeights: [MTLTexture]) throws -> MTLTexture {
         var blendedPyramid: [MTLTexture] = []
         for lvl in 0..<levels {
             blendedPyramid.append(try wtaFinalizeLevel(accValues[lvl]))

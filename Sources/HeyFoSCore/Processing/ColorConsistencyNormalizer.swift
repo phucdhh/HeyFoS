@@ -1,6 +1,8 @@
 import Metal
 import MetalPerformanceShaders
 import Accelerate
+import CoreGraphics
+import ImageIO
 import Logging
 
 /// Normalizes exposure across an image stack before focus blending.
@@ -140,6 +142,71 @@ final class ColorConsistencyNormalizer {
 
         // Return the same array — every texture was modified in-place
         return images
+    }
+
+    // MARK: - Streaming helpers (called once per image in the streaming pipeline)
+
+    /// Pre-compute mean luminances for all images from tiny URL thumbnails only.
+    /// No full-resolution images are loaded — uses CGImageSource 64×64 thumbnails.
+    /// Runs concurrently. Safe to call before any MTLTexture work.
+    func precomputeLuminancesFromURLs(_ urls: [URL]) -> [Double] {
+        var results = [Double](repeating: 0.5, count: urls.count)
+        let smallSize = 64
+        DispatchQueue.concurrentPerform(iterations: urls.count) { i in
+            let opts: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+                kCGImageSourceCreateThumbnailWithTransform:     false,
+                kCGImageSourceThumbnailMaxPixelSize:            smallSize
+            ]
+            guard let src = CGImageSourceCreateWithURL(urls[i] as CFURL, nil),
+                  let cg  = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+            else { return }
+            let w = cg.width, h = cg.height, n = w * h
+            var raw = [UInt8](repeating: 0, count: n * 4)
+            guard let ctx = CGContext(
+                data: &raw, width: w, height: h,
+                bitsPerComponent: 8, bytesPerRow: w * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            ) else { return }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            var luma = 0.0
+            for j in 0..<n {
+                luma += 0.2126 * Double(raw[j*4]) + 0.7152 * Double(raw[j*4+1]) + 0.0722 * Double(raw[j*4+2])
+            }
+            results[i] = luma / (Double(n) * 255.0)   // each i is unique — no data race
+        }
+        return results
+    }
+
+    /// Compute the luminance scale factor for one frame relative to the reference.
+    /// Returns 1.0 for the reference frame or when luminance is near zero.
+    /// Scale is clamped to [0.70, 1.40] to prevent over-correction.
+    func luminanceScale(frameIdx: Int, referenceIdx: Int, luminances: [Double]) -> Float {
+        guard frameIdx != referenceIdx else { return 1.0 }
+        let frameMean = luminances[frameIdx]
+        let refMean   = luminances[referenceIdx]
+        guard frameMean > 1e-6, refMean > 1e-6 else { return 1.0 }
+        return Float(min(max(refMean / frameMean, 0.70), 1.40))
+    }
+
+    /// Apply in-place luminance scale to one texture on the GPU.
+    /// No-op if |scale - 1| < 0.02.  Blocks until the GPU op completes.
+    func applyScaleInPlace(_ texture: MTLTexture, scale: Float) throws {
+        guard abs(scale - 1.0) >= 0.02 else { return }
+        guard let cmd = context.commandQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(scalePipeline)
+        enc.setTexture(texture, index: 0)
+        var s = scale
+        enc.setBytes(&s, length: MemoryLayout<Float>.size, index: 0)
+        let tg = MTLSize(width: 16, height: 16, depth: 1)
+        enc.dispatchThreadgroups(
+            MTLSize(width: (texture.width+15)/16, height: (texture.height+15)/16, depth: 1),
+            threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
     }
 
     // MARK: - Private
