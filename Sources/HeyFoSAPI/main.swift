@@ -196,12 +196,22 @@ func performProcessing(stackId: String, jobId: String, params: ProcessingParams,
         verbose: false,
         progressHandler: { pct, message in
             let progress = Int(pct * 100)
+            
+            var currentIdx = HeyFoSServer.jobStatuses[jobId]?["currentImageIndex"] as? Int ?? 0
+            if let slashRange = message.range(of: "/") {
+                let beforeSlash = message[..<slashRange.lowerBound]
+                if let spaceRange = beforeSlash.range(of: " ", options: .backwards),
+                   let parsedIdx = Int(beforeSlash[spaceRange.upperBound...]) {
+                    currentIdx = parsedIdx - 1
+                }
+            }
+            
             HeyFoSServer.jobStatuses[jobId] = [
                 "jobId": jobId,
                 "status": "processing",
                 "progress": progress,
                 "message": message,
-                "currentImageIndex": HeyFoSServer.jobStatuses[jobId]?["currentImageIndex"] as? Int ?? 0,
+                "currentImageIndex": currentIdx,
                 "totalImages": HeyFoSServer.jobStatuses[jobId]?["totalImages"] as? Int ?? files.count,
                 "hasPartialPreview": HeyFoSServer.jobStatuses[jobId]?["hasPartialPreview"] as? Bool ?? false,
                 "outputDir": outputDir.path
@@ -463,6 +473,12 @@ func processStack(req: Request) async throws -> ProcessStackResponse {
             try await performProcessing(stackId: stackId, jobId: jobId, params: params, outputDir: outputDir, uploadPath: uploadPath)
         } catch {
             print("Processing error: \(error)")
+            HeyFoSServer.jobStatuses[jobId] = [
+                "jobId": jobId,
+                "status": "failed",
+                "progress": 0,
+                "message": "Error: \(error.localizedDescription)"
+            ]
         }
     }
 

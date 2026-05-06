@@ -2,6 +2,8 @@ import Foundation
 import Metal
 import MetalPerformanceShaders
 import Logging
+import ImageIO
+import CoreGraphics
 
 /// Processes image stacks for focus stacking
 public final class StackProcessor {
@@ -162,6 +164,12 @@ public final class StackProcessor {
         // No adaptive downscaling — output matches input resolution exactly.
         let maxDimension = Int.max
         progressHandler?(0.01, "Preparing… (\(n) images)")
+        
+        // Extract metadata from the first image to preserve EXIF data
+        var sourceMetadata: [CFString: Any]? = nil
+        if let source = CGImageSourceCreateWithURL(imageURLs[0] as CFURL, nil) {
+            sourceMetadata = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        }
 
         // ── Phase 0: Pre-compute luminances from URL thumbnails ─────────────────
         // Load 64×64 CGImage thumbnails for every URL — no full-res images touched.
@@ -237,6 +245,16 @@ public final class StackProcessor {
 
                     try blender.pMaxStreamAccumulate(image: image, accValues: accValues, accWeights: accWeights)
 
+                    // Final explicit sync after each image to ensure GPU is fully healthy 
+                    // and no hidden timeouts occurred. We also check for GPU errors.
+                    if let cmd = metalContext.commandQueue.makeCommandBuffer() {
+                        cmd.commit()
+                        cmd.waitUntilCompleted()
+                        if let err = cmd.error {
+                            throw StackProcessingError.processingFailed("GPU pipeline failed at image \(idx) with error: \(err.localizedDescription)")
+                        }
+                    }
+                    
                     if partialPreviewCallback != nil && idx % previewEvery == 0 {
                         (previewTex, previewScore) = try quickBlender.blendPreviewStep(
                             newImage: image, newFocusMap: focusMap,
@@ -262,7 +280,7 @@ public final class StackProcessor {
 
             progressHandler?(0.95, "Saving result…")
             let outputURL = URL(fileURLWithPath: outputPath)
-            try imageLoader.saveTexture(result, to: outputURL)
+            try imageLoader.saveTexture(result, to: outputURL, withMetadata: sourceMetadata)
 
             // Show final PyBlend result AFTER saving so textureToNSImage's ~700 MB
             // allocation doesn't compete with saveTexture's readback.
@@ -333,13 +351,22 @@ public final class StackProcessor {
             progressHandler?(0.91, "Finalising…")
             let result = try blender.softBlendFinalize(accValues: accValues, accWeights: accWeights)
 
+            // Final check to ensure GPU didn't die during finalization
+            if let cmd = metalContext.commandQueue.makeCommandBuffer() {
+                cmd.commit()
+                cmd.waitUntilCompleted()
+                if let err = cmd.error {
+                    throw StackProcessingError.processingFailed("GPU failed during finalization: \(err.localizedDescription)")
+                }
+            }
+
             // Free accumulators immediately after finalization — frees ~1.8 GB before save
             accValues = []
             accWeights = []
 
             progressHandler?(0.95, "Saving result…")
             let outputURL = URL(fileURLWithPath: outputPath)
-            try imageLoader.saveTexture(result, to: outputURL)
+            try imageLoader.saveTexture(result, to: outputURL, withMetadata: sourceMetadata)
 
             // Show final result AFTER saving
             try partialPreviewCallback?(n - 1, n, result)

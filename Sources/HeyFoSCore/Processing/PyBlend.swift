@@ -422,7 +422,7 @@ public class PyBlend {
         // CRITICAL: Wait for ALL GPU operations to complete before returning
         if let commandBuffer = context.commandQueue.makeCommandBuffer() {
             commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
+            try safeWaitAndCheck(commandBuffer)
         }
 
         return result
@@ -528,10 +528,12 @@ public class PyBlend {
             blendedPyramid.append(try wtaFinalizeLevel(accValues[lvl]))
         }
         let result = try collapsePyramid(blendedPyramid)
+        
         if let cmd = context.commandQueue.makeCommandBuffer() {
             cmd.commit()
-            cmd.waitUntilCompleted()
+            try safeWaitAndCheck(cmd)
         }
+        
         return result
     }
 
@@ -921,6 +923,13 @@ public class PyBlend {
         return outputTexture
     }
     
+    private func safeWaitAndCheck(_ cmd: MTLCommandBuffer) throws {
+        cmd.waitUntilCompleted()
+        if let error = cmd.error {
+            throw NSError(domain: "PyBlend", code: -1, userInfo: [NSLocalizedDescriptionKey: "GPU execution failed: \(error.localizedDescription)"])
+        }
+    }
+
     /// Helper to clear a texture to zero
     private func clearTexture(_ texture: MTLTexture) throws {
         guard let cmd = context.commandQueue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else { return }

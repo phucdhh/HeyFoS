@@ -31,7 +31,15 @@ if ! brew list libraw &>/dev/null 2>&1; then
 fi
 echo "  ✓ Requirements met"
 
-# ── 2. Build release binary ──────────────────────────────────────────────────
+# ── 2a. Build React frontend ─────────────────────────────────────────────────
+echo ""
+echo "▸ Building React frontend…"
+cd "$SCRIPT_DIR/frontend"
+npm run build 2>&1 | grep -E "compiled|error|warning|File sizes" | sed 's/^/  /'
+cd "$SCRIPT_DIR"
+echo "  ✓ Frontend built → frontend/build/"
+
+# ── 2b. Build release binary ─────────────────────────────────────────────────
 echo ""
 echo "▸ Building HeyFoSApp (release · arm64)…"
 swift build -c release --arch arm64 --product HeyFoS 2>&1 | \

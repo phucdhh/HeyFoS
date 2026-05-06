@@ -4,10 +4,11 @@ import CoreImage
 import Metal
 import Accelerate
 import Logging
+import UniformTypeIdentifiers
 
 /// Loads images from various formats and converts to Metal textures
 public final class ImageLoader {
-    private let metalContext: MetalContext
+    let metalContext: MetalContext
     private let rawDecoder: LibRawDecoder
     private let logger = Logger(label: "com.heyfos.imageloader")
     
@@ -267,20 +268,23 @@ public final class ImageLoader {
     }
     
     /// Save Metal texture to TIFF file
-    public func saveTexture(_ texture: MTLTexture, to url: URL) throws {
+    public func saveTexture(_ texture: MTLTexture, to url: URL, withMetadata metadata: [CFString: Any]? = nil) throws {
         let width = texture.width
         let height = texture.height
-        let bytesPerRow = width * 4 * MemoryLayout<Float>.size
         
-        var pixelData = [Float](repeating: 0, count: width * height * 4)
+        let unormTexture = try convertTo8BitGPU(texture: texture)
+        
+        let bytesPerRow = width * 4 // RGBA8Unorm is 4 bytes per pixel
+        
+        var uint8Data = [UInt8](repeating: 0, count: width * height * 4)
         
         let region = MTLRegion(
             origin: MTLOrigin(x: 0, y: 0, z: 0),
             size: MTLSize(width: width, height: height, depth: 1)
         )
         
-        pixelData.withUnsafeMutableBytes { buffer in
-            texture.getBytes(
+        uint8Data.withUnsafeMutableBytes { buffer in
+            unormTexture.getBytes(
                 buffer.baseAddress!,
                 bytesPerRow: bytesPerRow,
                 from: region,
@@ -288,16 +292,7 @@ public final class ImageLoader {
             )
         }
         
-        // Convert Float32 -> UInt8 for export (Compatibility)
-        var uint8Data = [UInt8](repeating: 0, count: width * height * 4)
-        for i in 0..<pixelData.count {
-            let val = pixelData[i]
-            // Clamp [0, 1]
-            let clamped = min(max(val, 0.0), 1.0)
-            uint8Data[i] = UInt8(clamped * 255.0)
-        }
-        
-        // Force Alpha to 255 (Opaque) in case it was lost
+        // Force Alpha to 255 (Opaque) in case it was lost or not set properly
         for i in stride(from: 3, to: uint8Data.count, by: 4) {
              uint8Data[i] = 255
         }
@@ -305,26 +300,29 @@ public final class ImageLoader {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let uint8BytesPerRow = width * 4
         
-        guard let context = CGContext(
-            data: &uint8Data,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: uint8BytesPerRow,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            throw ImageLoadError.contextCreationFailed
+        let cgImageOpt = uint8Data.withUnsafeMutableBytes { ptr -> CGImage? in
+            guard let context = CGContext(
+                data: ptr.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: uint8BytesPerRow,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                return nil
+            }
+            return context.makeImage()
         }
         
-        guard let cgImage = context.makeImage() else {
+        guard let cgImage = cgImageOpt else {
             throw ImageLoadError.failedToSaveImage
         }
         
         // Save as TIFF with LZW compression
         guard let destination = CGImageDestinationCreateWithURL(
             url as CFURL,
-            kUTTypeTIFF,
+            UTType.tiff.identifier as CFString,
             1,
             nil
         ) else {
@@ -332,12 +330,38 @@ public final class ImageLoader {
         }
         
         // Add compression properties to reduce file size
-        let properties: [CFString: Any] = [
+        var finalProperties: [CFString: Any] = [
             kCGImageDestinationLossyCompressionQuality: 0.9,
             kCGImagePropertyTIFFCompression: 5 // LZW compression
         ]
         
-        CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
+        // Merge with existing metadata safely
+        if let metadata = metadata {
+            // Remove keys that conflict with the new Image data 
+            var strippedMetadata = metadata
+            strippedMetadata.removeValue(forKey: kCGImagePropertyPixelWidth)
+            strippedMetadata.removeValue(forKey: kCGImagePropertyPixelHeight)
+            strippedMetadata.removeValue(forKey: kCGImagePropertyDepth)
+            strippedMetadata.removeValue(forKey: kCGImagePropertyOrientation)
+            strippedMetadata.removeValue(forKey: kCGImagePropertyColorModel)
+            
+            // If the original has a TIFF dict, we need to explicitly remove bit depth / image sizes that conflict with RGBA8Unorm
+            if var tiffDict = strippedMetadata[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
+                tiffDict.removeValue(forKey: kCGImagePropertyTIFFPhotometricInterpretation)
+                tiffDict.removeValue(forKey: "BitsPerSample" as CFString)
+                tiffDict.removeValue(forKey: "SamplesPerPixel" as CFString)
+                tiffDict.removeValue(forKey: "ImageWidth" as CFString)
+                tiffDict.removeValue(forKey: "ImageLength" as CFString)
+                tiffDict[kCGImagePropertyTIFFCompression] = 5 // Ensure LZW compression
+                strippedMetadata[kCGImagePropertyTIFFDictionary] = tiffDict
+            }
+            
+            for (key, value) in strippedMetadata {
+                finalProperties[key] = value
+            }
+        }
+        
+        CGImageDestinationAddImage(destination, cgImage, finalProperties as CFDictionary)
         
         guard CGImageDestinationFinalize(destination) else {
             throw ImageLoadError.failedToSaveImage

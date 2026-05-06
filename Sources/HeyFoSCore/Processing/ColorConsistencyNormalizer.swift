@@ -192,7 +192,9 @@ final class ColorConsistencyNormalizer {
         let frameMean = luminances[frameIdx]
         let refMean   = luminances[referenceIdx]
         guard frameMean > 1e-6, refMean > 1e-6 else { return 1.0 }
-        return Float(min(max(refMean / frameMean, 0.70), 1.40))
+        let ratio = refMean / frameMean
+        guard !ratio.isNaN else { return 1.0 }
+        return Float(min(max(ratio, 0.70), 1.40))
     }
 
     /// Apply in-place luminance scale to one texture on the GPU.
