@@ -165,10 +165,10 @@ public final class StackProcessor {
         let maxDimension = Int.max
         progressHandler?(0.01, "Preparing… (\(n) images)")
         
-        // Extract metadata from the first image to preserve EXIF data
-        var sourceMetadata: [CFString: Any]? = nil
+        // Extract full metadata (EXIF + XMP + IPTC) from the first image
+        var sourceMetadata: CGImageMetadata? = nil
         if let source = CGImageSourceCreateWithURL(imageURLs[0] as CFURL, nil) {
-            sourceMetadata = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+            sourceMetadata = CGImageSourceCopyMetadataAtIndex(source, 0, nil)
         }
 
         // ── Phase 0: Pre-compute luminances from URL thumbnails ─────────────────

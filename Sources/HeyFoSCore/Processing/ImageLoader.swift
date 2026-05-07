@@ -267,8 +267,8 @@ public final class ImageLoader {
         return texture
     }
     
-    /// Save Metal texture to TIFF file
-    public func saveTexture(_ texture: MTLTexture, to url: URL, withMetadata metadata: [CFString: Any]? = nil) throws {
+    /// Save Metal texture to TIFF file, optionally preserving full source metadata (EXIF + XMP + IPTC)
+    public func saveTexture(_ texture: MTLTexture, to url: URL, withMetadata metadata: CGImageMetadata? = nil) throws {
         let width = texture.width
         let height = texture.height
         
@@ -329,39 +329,20 @@ public final class ImageLoader {
             throw ImageLoadError.failedToSaveImage
         }
         
-        // Add compression properties to reduce file size
-        var finalProperties: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: 0.9,
-            kCGImagePropertyTIFFCompression: 5 // LZW compression
+        // Base destination properties (compression only — no metadata here)
+        let destProperties: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: 1.0,
+            kCGImagePropertyTIFFDictionary: [
+                kCGImagePropertyTIFFCompression: 5  // LZW
+            ] as CFDictionary
         ]
-        
-        // Merge with existing metadata safely
+
         if let metadata = metadata {
-            // Remove keys that conflict with the new Image data 
-            var strippedMetadata = metadata
-            strippedMetadata.removeValue(forKey: kCGImagePropertyPixelWidth)
-            strippedMetadata.removeValue(forKey: kCGImagePropertyPixelHeight)
-            strippedMetadata.removeValue(forKey: kCGImagePropertyDepth)
-            strippedMetadata.removeValue(forKey: kCGImagePropertyOrientation)
-            strippedMetadata.removeValue(forKey: kCGImagePropertyColorModel)
-            
-            // If the original has a TIFF dict, we need to explicitly remove bit depth / image sizes that conflict with RGBA8Unorm
-            if var tiffDict = strippedMetadata[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
-                tiffDict.removeValue(forKey: kCGImagePropertyTIFFPhotometricInterpretation)
-                tiffDict.removeValue(forKey: "BitsPerSample" as CFString)
-                tiffDict.removeValue(forKey: "SamplesPerPixel" as CFString)
-                tiffDict.removeValue(forKey: "ImageWidth" as CFString)
-                tiffDict.removeValue(forKey: "ImageLength" as CFString)
-                tiffDict[kCGImagePropertyTIFFCompression] = 5 // Ensure LZW compression
-                strippedMetadata[kCGImagePropertyTIFFDictionary] = tiffDict
-            }
-            
-            for (key, value) in strippedMetadata {
-                finalProperties[key] = value
-            }
+            // Use CGImageDestinationAddImageAndMetadata to copy full EXIF + XMP + IPTC
+            CGImageDestinationAddImageAndMetadata(destination, cgImage, metadata, destProperties as CFDictionary)
+        } else {
+            CGImageDestinationAddImage(destination, cgImage, destProperties as CFDictionary)
         }
-        
-        CGImageDestinationAddImage(destination, cgImage, finalProperties as CFDictionary)
         
         guard CGImageDestinationFinalize(destination) else {
             throw ImageLoadError.failedToSaveImage

@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 APP_NAME="HeyFoS"
-APP_VERSION="1.0.0"
+APP_VERSION="$(date +%Y-%m-%d-%H-%M)"
 APP_BUNDLE="$SCRIPT_DIR/release/$APP_NAME.app"
 APP_MACOS="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 APP_FRAMEWORKS="$APP_BUNDLE/Contents/Frameworks"
